@@ -102,7 +102,7 @@ export default function PatientProfile() {
       return;
     }
     setAnalyzing(true);
-    setMsg("Sending the photo to the AI service… this can take up to a minute.");
+    setMsg("Sending the photo to the AI service… the English and Telugu results can take up to two minutes.");
     try {
       const r = await api("/ai/analyze", { method: "POST", body: JSON.stringify({ screening_id: sid, image_id: target.id }) });
       if (r.status === "image_insufficient") {

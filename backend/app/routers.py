@@ -924,6 +924,14 @@ def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, b
     return sent
 
 
+def rollback_appointment_notifications(db: Session, appointment_id: str) -> int:
+    """Remove every alert that was sent about this appointment (scheduled, live, joined, reminder...).
+
+    Alerts carry an [appt:<id>] tag, so ending or deleting a call takes them away from every user's list.
+    """
+    return db.query(Notification).filter(Notification.body.like(f"%[appt:{appointment_id}]%")).delete(synchronize_session=False)
+
+
 def make_call_reminders(db: Session, user: User) -> None:
     """Lazy 'starting soon' reminders: created when the user's notifications are fetched."""
     now = datetime.now(timezone.utc)
@@ -1035,6 +1043,7 @@ def patch_appointment(
     elif body.status == "RESCHEDULED":
         notify_appointment(db, rec, user, f"{label} rescheduled", f"New time: {fmt_slot(rec.slot)}.")
     elif body.status == "CANCELLED":
+        rollback_appointment_notifications(db, rec.id)  # drop the earlier scheduled / live / reminder alerts first
         notify_appointment(db, rec, user, f"{label} cancelled", f"The booking for {fmt_slot(rec.slot)} was cancelled.")
     elif body.status == "CONFIRMED":
         notify_appointment(db, rec, user, f"{label} confirmed", f"Confirmed for {fmt_slot(rec.slot)}.")
@@ -1047,6 +1056,51 @@ def patch_appointment(
     audit(db, user.id, "appointment.status", f"appointment:{rec.id}", body.status)
     db.commit()
     return {"id": rec.id, "status": rec.status, "attendance_outcome": rec.attendance_outcome}
+
+
+@router.post("/appointments/{appointment_id}/end")
+def end_call(
+    appointment_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("navigator", "specialist", "medical_officer")),
+):
+    """Host stops the Google Meet: the link is removed, the booking is cancelled and every earlier alert about it is rolled back."""
+    rec = db.get(Appointment, appointment_id)
+    if not rec:
+        raise HTTPException(404, "Appointment not found")
+    if rec.kind != "video":
+        raise HTTPException(422, "Only video consultations have a call to end")
+    rec.video_url = None
+    rec.video_ref = None
+    rec.status = "CANCELLED"
+    removed = rollback_appointment_notifications(db, rec.id)
+    audit(db, user.id, "appointment.end_call", f"appointment:{rec.id}", f"alerts_removed={removed}")
+    db.commit()
+    return {"id": rec.id, "status": rec.status, "has_meet_link": False, "alerts_removed": removed}
+
+
+@router.delete("/appointments/{appointment_id}")
+def delete_appointment(
+    appointment_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("navigator", "specialist", "medical_officer")),
+):
+    """Delete the appointment (and its Meet link) and roll back every alert about it."""
+    rec = db.get(Appointment, appointment_id)
+    if not rec:
+        raise HTTPException(404, "Appointment not found")
+    referral_id = rec.referral_id
+    removed = rollback_appointment_notifications(db, rec.id)
+    db.delete(rec)
+    db.flush()
+    ref = db.get(Referral, referral_id)
+    if ref and db.query(Appointment).filter(Appointment.referral_id == referral_id).count() == 0:
+        s = db.query(Screening).join(ClinicalReview, ClinicalReview.screening_id == Screening.id).filter(ClinicalReview.id == ref.review_id).first()
+        if s and s.status == "APPOINTED":
+            s.status = "REFERRAL_PLANNED"
+    audit(db, user.id, "appointment.delete", f"appointment:{appointment_id}", f"alerts_removed={removed}")
+    db.commit()
+    return {"deleted": True, "id": appointment_id, "alerts_removed": removed}
 
 
 def appointment_out(a: Appointment) -> dict:

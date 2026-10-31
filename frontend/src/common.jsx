@@ -4,9 +4,16 @@ import { strings } from "./i18n";
 export function useI18n() {
   const [lang, setLang] = useState(localStorage.getItem("lang") || "en");
   const t = strings[lang] || strings.en;
+  // every component using useI18n follows a language change immediately (e.g. the AI card switches to its Telugu output)
+  useEffect(() => {
+    const h = (e) => setLang(e.detail);
+    window.addEventListener("lang-changed", h);
+    return () => window.removeEventListener("lang-changed", h);
+  }, []);
   const switchLang = (value) => {
-    setLang(value);
     localStorage.setItem("lang", value);
+    setLang(value);
+    window.dispatchEvent(new CustomEvent("lang-changed", { detail: value }));
   };
   return { lang, t, switchLang };
 }
@@ -66,6 +73,29 @@ export const AI_LABELS = {
   no_suspicious_finding_example: { text: "No disease detected", kind: "ok" },
   inconclusive_example: { text: "Cannot be assessed", kind: "neutral" },
 };
+// Headings of the AI card in both languages. The AI's own text comes from its English output or its Telugu output.
+const AI_UI = {
+  en: {
+    labels: null, urgency: null, likelihood: "Likelihood", mostLikely: "Most likely", other: "Other possibilities", assessment: "Assessment",
+    clinSummary: "Summary for the reviewing clinician", given: "Health suggestions given", guidanceGiven: "Guidance given to the field worker",
+    patientMsg: "Message for the patient", suggestions: "Health suggestions", seeSooner: "See a doctor sooner if", nextSteps: "Next steps for the health worker",
+    consult: "Doctor consultation:", cannot: "This photo cannot be assessed – please retake it.", issues: "Photo issues", howRetake: "How to retake the photo",
+    disclaimer: "Provisional AI impression – a doctor must confirm any diagnosis.", noTe: "Telugu version is not available for this result; showing English.",
+  },
+  te: {
+    labels: {
+      suspicious_example: "డాక్టర్ దృష్టి అవసరం", condition_possible_example: "సమస్య ఉండే అవకాశం",
+      no_suspicious_finding_example: "ఎటువంటి వ్యాధి కనుగొనబడలేదు", inconclusive_example: "ఈ ఫోటోతో అంచనా వేయలేము",
+    },
+    urgency: { urgent: "వెంటనే డాక్టర్‌ను కలవండి", soon: "త్వరలో డాక్టర్‌ను కలవండి", routine: "సాధారణ పరీక్ష" },
+    likelihood: "అవకాశం", mostLikely: "అత్యంత అవకాశం ఉన్నది", other: "ఇతర అవకాశాలు", assessment: "అంచనా",
+    clinSummary: "సమీక్షించే డాక్టర్ కోసం సారాంశం", given: "ఇచ్చిన ఆరోగ్య సూచనలు", guidanceGiven: "ఆరోగ్య కార్యకర్తకు ఇచ్చిన మార్గదర్శకం",
+    patientMsg: "రోగికి సందేశం", suggestions: "ఆరోగ్య సూచనలు", seeSooner: "ఇవి కనిపిస్తే త్వరగా డాక్టర్‌ను కలవండి", nextSteps: "ఆరోగ్య కార్యకర్త తదుపరి చర్యలు",
+    consult: "డాక్టర్ సంప్రదింపు:", cannot: "ఈ ఫోటోను అంచనా వేయలేము – దయచేసి మళ్లీ తీయండి.", issues: "ఫోటో సమస్యలు", howRetake: "ఫోటో మళ్లీ ఎలా తీయాలి",
+    disclaimer: "తాత్కాలిక AI అంచనా – ఏ నిర్ధారణనైనా డాక్టర్ ధృవీకరించాలి.", noTe: "ఈ ఫలితానికి తెలుగు వెర్షన్ అందుబాటులో లేదు; ఇంగ్లీష్ చూపిస్తున్నాము.",
+  },
+};
+
 export const URGENCY_KIND = { urgent: "bad", soon: "warn", routine: "ok" };
 export const URGENCY_TEXT = { urgent: "See a doctor urgently", soon: "See a doctor soon", routine: "Routine check-up" };
 
@@ -110,72 +140,80 @@ export function AiFeedback({ analysis, audience = "worker" }) {
       </p>
     );
   }
-  const label = AI_LABELS[analysis.research_label] || { text: analysis.research_label || analysis.status, kind: "neutral" };
+  const ui = AI_UI[lang] || AI_UI.en;
+  const te = lang === "te" ? fb.translations?.te : null; // output 2: the Telugu version from the AI
+  const base = AI_LABELS[analysis.research_label] || { text: analysis.research_label || analysis.status, kind: "neutral" };
+  const label = { ...base, text: ui.labels?.[analysis.research_label] || base.text };
   const usable = fb.image_assessment?.usable !== false;
-  const cond = fb.predicted_condition || {};
+  const condEn = fb.predicted_condition || {};
+  const cond = { ...condEn, name: te?.predicted_condition?.name || condEn.name, other_possibilities: te?.predicted_condition?.other_possibilities?.length ? te.predicted_condition.other_possibilities : condEn.other_possibilities };
+  const pick = (k) => (te && te[k] && (!Array.isArray(te[k]) || te[k].length) ? te[k] : fb[k]);
+  const issues = te?.image_assessment?.issues?.length ? te.image_assessment.issues : fb.image_assessment?.issues;
   const patientText = fb.patient_message?.[lang] || fb.patient_message?.en;
+  const urgencyText = ui.urgency?.[fb.suggested_urgency] || URGENCY_TEXT[fb.suggested_urgency];
   return (
-    <div className="ai-box">
+    <div className="ai-box" lang={lang}>
       <div className="ai-head">
         <Pill kind={label.kind}>{label.text}</Pill>
-        {usable && fb.suggested_urgency && <Pill kind={URGENCY_KIND[fb.suggested_urgency]}>{URGENCY_TEXT[fb.suggested_urgency]}</Pill>}
-        {usable && cond.disease_detected && cond.likelihood && <Pill kind="neutral">Likelihood: {cond.likelihood}</Pill>}
+        {usable && fb.suggested_urgency && <Pill kind={URGENCY_KIND[fb.suggested_urgency]}>{urgencyText}</Pill>}
+        {usable && cond.disease_detected && cond.likelihood && <Pill kind="neutral">{ui.likelihood}: {cond.likelihood}</Pill>}
         <span className="small">{analysis.provider} · {analysis.model_version}</span>
       </div>
+      {lang === "te" && !te && <p className="small">{ui.noTe}</p>}
       {!usable ? (
         <>
           <div className="ai-retake">
-            <b>This photo cannot be assessed – please retake it.</b>
+            <b>{ui.cannot}</b>
           </div>
-          <BulletList title="Photo issues" items={fb.image_assessment?.issues} />
-          <BulletList title="How to retake the photo" items={fb.recapture_tips} />
+          <BulletList title={ui.issues} items={issues} />
+          <BulletList title={ui.howRetake} items={pick("recapture_tips")} />
         </>
       ) : (
         <>
           <div className="ai-condition">
-            <span className="small">Most likely</span>
+            <span className="small">{ui.mostLikely}</span>
             <h3>{cond.name || "—"}</h3>
-            {cond.other_possibilities?.length > 0 && <p className="small">Other possibilities: {cond.other_possibilities.join(", ")}</p>}
+            {cond.other_possibilities?.length > 0 && <p className="small">{ui.other}: {cond.other_possibilities.join(", ")}</p>}
           </div>
-          {fb.analysis && (
+          {pick("analysis") && (
             <div className="ai-block">
-              <h4>Assessment</h4>
-              <p>{fb.analysis}</p>
+              <h4>{ui.assessment}</h4>
+              <p>{pick("analysis")}</p>
             </div>
           )}
           {audience === "clinician" ? (
             <>
-              {fb.clinician_summary && (
+              {pick("clinician_summary") && (
                 <div className="ai-block">
-                  <h4>Summary for the reviewing clinician</h4>
-                  <p>{fb.clinician_summary}</p>
+                  <h4>{ui.clinSummary}</h4>
+                  <p>{pick("clinician_summary")}</p>
                 </div>
               )}
-              <BulletList title="Health suggestions given" items={fb.health_suggestions} />
-              <BulletList title="Guidance given to the field worker" items={fb.health_worker_guidance} />
+              <BulletList title={ui.given} items={pick("health_suggestions")} />
+              <BulletList title={ui.guidanceGiven} items={pick("health_worker_guidance")} />
             </>
           ) : (
             <>
               {patientText && (
                 <div className="ai-block ai-patient">
-                  <h4>Message for the patient</h4>
+                  <h4>{ui.patientMsg}</h4>
                   <p>{patientText}</p>
                 </div>
               )}
-              <BulletList title="Health suggestions" items={fb.health_suggestions} />
-              <BulletList title="See a doctor sooner if" items={fb.warning_signs} />
-              <BulletList title="Next steps for the health worker" items={fb.health_worker_guidance} />
+              <BulletList title={ui.suggestions} items={pick("health_suggestions")} />
+              <BulletList title={ui.seeSooner} items={pick("warning_signs")} />
+              <BulletList title={ui.nextSteps} items={pick("health_worker_guidance")} />
             </>
           )}
-          {fb.consult_advice && (
+          {pick("consult_advice") && (
             <div className="ai-consult">
-              <b>Doctor consultation:</b> {fb.consult_advice}
+              <b>{ui.consult}</b> {pick("consult_advice")}
             </div>
           )}
         </>
       )}
-      {fb.limitations && <p className="small">{fb.limitations}</p>}
-      <p className="small ai-disclaimer">{analysis.warning} · Provisional AI impression – a doctor must confirm any diagnosis.</p>
+      {pick("limitations") && <p className="small">{pick("limitations")}</p>}
+      <p className="small ai-disclaimer">{analysis.warning} · {ui.disclaimer}</p>
     </div>
   );
 }

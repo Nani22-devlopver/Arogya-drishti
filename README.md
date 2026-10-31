@@ -183,6 +183,11 @@ Google Meet is the only video provider. Jitsi was removed.
 - **MO, specialist and navigator pages read the database directly.** `GET /screenings?awaiting_review=true` returns every screening without a signed review, whatever stage the health worker left it in (with patient name and village). On start, `SEED_DEMO_DATA=true` inserts synthetic cases at each stage (awaiting review, referred, appointment, investigation, closed) once per database, so those pages are never empty.
 - **Supabase-ready.** Only `DATABASE_URL` changes. `postgres://` and `postgresql://` URLs are accepted, `sslmode=require` is added for `*.supabase.co` / `*.supabase.com`, and the pool recycles idle connections. Tables are created on start. Uploaded photos are still stored in `STORAGE_DIR` (not in the database).
 
+## Latest changes (English + Telugu AI output, end/delete Meet)
+
+- **Two AI outputs.** After the vision model returns the English assessment, a second text-only Ollama call produces the same assessment in Telugu, stored in `feedback.translations.te`. When the app language is Telugu, the AI card (condition, assessment, suggestions, warning signs, doctor advice, clinician summary, headings and pills) switches to the Telugu output instantly; English shows again when you switch back. If the Telugu call fails, the English result is kept and the card says Telugu is unavailable. No database change. Analysis can now take up to two model calls.
+- **Host can stop or delete a Google Meet.** On **Appointments**, a specialist, medical officer or navigator can press **End call** (`POST /appointments/{id}/end`: link removed, booking cancelled) or **Delete** (`DELETE /appointments/{id}`). Both remove every alert about that appointment (scheduled, live, joined, reminder) from all users' notification lists, so badges and lists update on their next refresh (within 20 s). Cancelling with the status button also clears the earlier alerts before sending its single "cancelled" notice. Health workers cannot end or delete.
+
 ## Troubleshooting
 
 - **Blank page or "something went wrong" on a role's page:** open the browser console (F12). After updating, run `npm install` once and restart `npm run dev`; hard-refresh (Ctrl+Shift+R) so the old service-worker cache is not served.

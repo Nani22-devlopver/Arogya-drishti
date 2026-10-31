@@ -473,3 +473,95 @@ def test_database_url_normalised_for_supabase():
     assert url.startswith("postgresql+psycopg2://") and "sslmode=require" in url
     local = normalize_database_url("postgresql+psycopg2://postgres:pw@localhost:5432/x")
     assert "sslmode" not in local
+
+
+def test_ollama_returns_english_and_telugu_outputs(monkeypatch):
+    import json as _json
+    from types import SimpleNamespace
+
+    from app.ai import ollama_adapter
+
+    english = {
+        "image_assessment": {"is_oral_photo": True, "usable": True, "issues": []},
+        "predicted_condition": {"disease_detected": True, "name": "Oral leukoplakia (most likely)", "likelihood": "medium", "other_possibilities": ["Oral lichen planus"]},
+        "analysis": "English analysis.", "research_label": "condition_possible_example", "confidence": "medium", "suggested_urgency": "soon",
+        "health_suggestions": ["Stop tobacco"], "warning_signs": ["Ulcer"], "consult_advice": "See a dentist soon.",
+        "health_worker_guidance": ["Arrange review"], "recapture_tips": [], "clinician_summary": "Examine cheek.",
+        "patient_message": {"en": "See a doctor.", "te": "డాక్టర్‌ని కలవండి."}, "limitations": "Photo cannot confirm.",
+    }
+    telugu = {
+        "condition_name": "ల్యూకోప్లాకియా", "other_possibilities": ["లైకెన్ ప్లానస్"], "photo_issues": [], "analysis": "తెలుగు విశ్లేషణ.",
+        "health_suggestions": ["పొగాకు మానండి"], "warning_signs": ["పుండు"], "consult_advice": "త్వరలో డాక్టర్‌ను కలవండి.",
+        "health_worker_guidance": ["సమీక్ష ఏర్పాటు చేయండి"], "recapture_tips": [], "clinician_summary": "చెంపను పరీక్షించండి.", "limitations": "ఫోటోతో నిర్ధారణ కాదు.",
+    }
+    replies = [english, telugu]
+    calls = []
+
+    class FakeClient:
+        def chat(self, **kw):
+            calls.append(kw)
+            return SimpleNamespace(message=SimpleNamespace(content=_json.dumps(replies[len(calls) - 1], ensure_ascii=False)))
+
+    monkeypatch.setattr(ollama_adapter, "_client", lambda: FakeClient())
+    monkeypatch.setattr(ollama_adapter.settings, "OLLAMA_API_KEY", "test-key")
+    out = ollama_adapter.analyze(make_image(), "scr-1", {"view": "cheek"})
+    fb = out["feedback"]
+    assert len(calls) == 2 and "images" not in calls[1]["messages"][-1]  # second call is text-only
+    assert fb["analysis"] == "English analysis."
+    te = fb["translations"]["te"]
+    assert te["predicted_condition"]["name"] == "ల్యూకోప్లాకియా" and te["analysis"] == "తెలుగు విశ్లేషణ."
+    assert te["health_suggestions"] == ["పొగాకు మానండి"] and te["patient_message"] == "డాక్టర్‌ని కలవండి."
+
+
+def test_telugu_failure_keeps_english(monkeypatch):
+    import json as _json
+    from types import SimpleNamespace
+
+    from app.ai import ollama_adapter
+
+    n = {"i": 0}
+
+    class FakeClient:
+        def chat(self, **kw):
+            n["i"] += 1
+            if n["i"] == 2:
+                raise RuntimeError("boom")
+            return SimpleNamespace(message=SimpleNamespace(content=_json.dumps({"predicted_condition": {"name": "No disease detected", "disease_detected": False}, "analysis": "Fine."})))
+
+    monkeypatch.setattr(ollama_adapter, "_client", lambda: FakeClient())
+    monkeypatch.setattr(ollama_adapter.settings, "OLLAMA_API_KEY", "test-key")
+    out = ollama_adapter.analyze(make_image(), "scr-2", {})
+    assert out["feedback"]["analysis"] == "Fine." and "translations" not in out["feedback"]
+
+
+def test_host_ends_or_deletes_call_and_alerts_roll_back():
+    from app.models import Notification
+    from app.seed import seed_demo_pipeline
+
+    db = SessionLocal()
+    try:
+        seed_demo_pipeline(db)
+    finally:
+        db.close()
+    spec, hw, nav = auth("spec@demo.local"), auth("hw@demo.local"), auth("nav@demo.local")
+    ref = next(r for r in client.get("/referrals", headers=spec).json() if "Appa Rao" in (r["patient_name"] or ""))
+
+    def alerts_about(headers, appt_id):
+        return [n for n in client.get("/notifications", headers=headers).json() if f"[appt:{appt_id}]" in n["body"]]
+
+    a = client.post("/appointments", headers=spec, json={"referral_id": ref["id"], "kind": "video", "start_now": True, "status": "CONFIRMED", "meet_url": "https://meet.google.com/abc-defg-hij"})
+    assert a.status_code == 200, a.text
+    aid = a.json()["id"]
+    assert alerts_about(nav, aid)  # the live alert reached the navigator
+
+    ended = client.post(f"/appointments/{aid}/end", headers=spec)
+    assert ended.status_code == 200 and ended.json()["status"] == "CANCELLED" and ended.json()["has_meet_link"] is False
+    assert alerts_about(nav, aid) == [] and alerts_about(hw, aid) == []
+    assert client.get(f"/appointments/{aid}/video", headers=hw).status_code == 403  # link no longer active
+
+    b = client.post("/appointments", headers=spec, json={"referral_id": ref["id"], "kind": "video", "slot": "2030-01-01T10:00:00+05:30", "status": "CONFIRMED", "meet_url": "https://meet.google.com/xyz-abcd-efg"})
+    bid = b.json()["id"]
+    assert alerts_about(nav, bid)
+    assert client.delete(f"/appointments/{bid}", headers=hw).status_code == 403  # health worker cannot delete
+    assert client.delete(f"/appointments/{bid}", headers=spec).status_code == 200
+    assert alerts_about(nav, bid) == [] and client.get(f"/appointments/{bid}", headers=spec).status_code == 404

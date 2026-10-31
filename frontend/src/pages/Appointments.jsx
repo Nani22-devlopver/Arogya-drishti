@@ -25,6 +25,32 @@ export default function Appointments() {
     }
   }
 
+  async function endCall(id) {
+    if (!window.confirm("End this Google Meet? The link is removed and everyone's alerts about it are withdrawn.")) return;
+    setErr("");
+    try {
+      const r = await api(`/appointments/${id}/end`, { method: "POST" });
+      toast(`Call ended. ${r.alerts_removed} alert(s) rolled back.`);
+      window.dispatchEvent(new Event("notes-changed"));
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function remove(id) {
+    if (!window.confirm("Delete this appointment? Its Meet link and all alerts about it are removed for everyone.")) return;
+    setErr("");
+    try {
+      const r = await api(`/appointments/${id}`, { method: "DELETE" });
+      toast(`Appointment deleted. ${r.alerts_removed} alert(s) rolled back.`);
+      window.dispatchEvent(new Event("notes-changed"));
+      await load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
   async function saveLink(id) {
     setErr("");
     try {
@@ -71,6 +97,10 @@ export default function Appointments() {
                       {["CONFIRMED", "COMPLETED", "MISSED", "CANCELLED"].map((s) => (
                         <button key={s} className="secondary sm" onClick={() => patch(a.id, s)}>{s}</button>
                       ))}
+                      {a.kind === "video" && a.has_meet_link && a.status !== "CANCELLED" && (
+                        <button className="secondary sm" onClick={() => endCall(a.id)}>End call</button>
+                      )}
+                      <button className="secondary sm" onClick={() => remove(a.id)}>Delete</button>
                     </div>
                     <div className="row">
                       <DateTimePick label="Reschedule to" value={resched[a.id] ?? slotToLocalInput(a.slot)} onChange={(v) => setResched({ ...resched, [a.id]: v })} />
