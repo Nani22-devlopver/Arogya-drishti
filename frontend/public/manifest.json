@@ -3,7 +3,7 @@
   "short_name": "Drishti",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#eaf4ff",
-  "theme_color": "#087c9e",
+  "background_color": "#eef0f6",
+  "theme_color": "#12183a",
   "lang": "en"
 }
