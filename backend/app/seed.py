@@ -122,8 +122,7 @@ def seed_demo_pipeline(db: Session) -> None:
     if not hw or not mo:
         return
     now = datetime.now(timezone.utc)
-    storage = Path(settings.STORAGE_DIR)
-    storage.mkdir(parents=True, exist_ok=True)
+    from . import supabase_storage
 
     def patient(name, age, sex, phone, village, symptoms, tobacco, days_ago):
         p = Patient(
@@ -149,10 +148,10 @@ def seed_demo_pipeline(db: Session) -> None:
         if photo:
             data = _synthetic_photo()
             image_id = uid()
-            (storage / f"{image_id}.bin").write_bytes(data)
+            supabase_storage.upload(f"{s.id}/{image_id}.jpg", data, "image/jpeg")
             db.add(ImageRecord(
                 id=image_id, screening_id=s.id, view="cheek", checksum=hashlib.sha256(data).hexdigest(),
-                storage_key=f"{image_id}.bin", quality_status="acceptable" if ai else "pending_ai",
+                storage_key=f"{s.id}/{image_id}.jpg", quality_status="acceptable" if ai else "pending_ai",
                 created_by=hw.id, created_at=s.created_at,
             ))
             db.flush()  # models declare no relationships, so write the image row before anything that references it

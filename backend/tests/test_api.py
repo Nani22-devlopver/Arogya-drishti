@@ -10,15 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # Use a SEPARATE PostgreSQL database for tests (tables are dropped/recreated).
-os.environ["DATABASE_URL"] = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/aarogya_drishti_test",
-)
+# Point TEST_DATABASE_URL at a throwaway Postgres (tables are dropped!). NEVER your real Supabase project.
+os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ["SEED_ON_START"] = "true"
 os.environ["SEED_DEMO_DATA"] = "false"  # keep the journey tests deterministic; test_roles_load_straight_from_db seeds explicitly
 os.environ["LOCAL_QUALITY_CHECK"] = "true"  # existing tests exercise the local gate; see test_ai_judges_quality_when_local_check_off
 os.environ["JWT_SECRET"] = "test-secret-not-for-production-use-32b"
 os.environ["STORAGE_DIR"] = str(ROOT / "storage-test")
+
+from app import supabase_storage  # noqa: E402
+
+_FAKE_BUCKET: dict[str, bytes] = {}
+supabase_storage.ensure_bucket = lambda: None
+supabase_storage.upload = lambda key, data, content_type="application/octet-stream": _FAKE_BUCKET.__setitem__(key, data)
+supabase_storage.download = lambda key: _FAKE_BUCKET.get(key)
 
 from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402

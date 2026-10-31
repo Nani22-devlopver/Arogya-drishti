@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -38,8 +38,7 @@ from .ai.ollama_adapter import OllamaError, analyze as ollama_analyze
 from .ai.quality import MAX_BYTES, QualityResult, check_quality
 
 router = APIRouter()
-storage = Path(settings.STORAGE_DIR)
-storage.mkdir(parents=True, exist_ok=True)
+from . import supabase_storage
 
 REQUIRED_CONSENTS = {"examination", "imaging"}
 
@@ -530,14 +529,18 @@ def upload_image(
         quality = QualityResult("pending_ai", None)
     checksum = hashlib.sha256(data).hexdigest()
     image_id = uid()
-    path = storage / f"{image_id}.bin"
-    path.write_bytes(data)
+    ext, mime = supabase_storage.detect_type(data)
+    storage_key = f"{s.id}/{image_id}{ext}"  # grouped per screening inside the Supabase bucket
+    try:
+        supabase_storage.upload(storage_key, data, mime)
+    except Exception as exc:
+        raise HTTPException(502, f"Image storage unavailable: {exc}")
     rec = ImageRecord(
         id=image_id,
         screening_id=s.id,
         view=view,
         checksum=checksum,
-        storage_key=str(path.name),
+        storage_key=storage_key,
         quality_status=quality.status,
         quality_reason=quality.reason,
         blur_score=quality.blur_score,
@@ -579,12 +582,15 @@ def download_image(
     rec = db.get(ImageRecord, image_id)
     if not rec or rec.screening_id != screening_id:
         raise HTTPException(404, "Image not found")
-    path = storage / rec.storage_key
-    if not path.exists():
+    try:
+        blob = supabase_storage.download(rec.storage_key)
+    except Exception as exc:
+        raise HTTPException(502, f"Image storage unavailable: {exc}")
+    if blob is None:
         raise HTTPException(404, "Stored file missing")
     audit(db, user.id, "image.view", f"image:{image_id}")
     db.commit()
-    return FileResponse(path, media_type="application/octet-stream")
+    return Response(content=blob, media_type=supabase_storage.mime_for_key(rec.storage_key), headers={"X-Content-Type-Options": "nosniff"})
 
 
 def _record_failed_analysis(db: Session, s: Screening, image_id: str | None, provider: str, model: str, user: User, event: str, reason: str | None = None) -> AiAnalysis:
@@ -658,10 +664,12 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
             "clinical_use": False,
             "warning": "NOT FOR CLINICAL USE",
         }
-    path = storage / image.storage_key
-    if not path.exists():
+    try:
+        raw = supabase_storage.download(image.storage_key)
+    except Exception as exc:
+        raise HTTPException(502, f"Image storage unavailable: {exc}")
+    if raw is None:
         raise HTTPException(404, "Stored file missing")
-    raw = path.read_bytes()
     if hashlib.sha256(raw).hexdigest() != image.checksum:
         raise HTTPException(409, "The stored photo does not match its upload record. Please upload the photo again.")
 

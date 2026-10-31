@@ -7,10 +7,12 @@ from .config import settings
 from .db import Base, SessionLocal, engine, ensure_schema
 from .routers import router
 from .seed import seed_if_empty
+from . import supabase_storage
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    supabase_storage.ensure_bucket()
     Base.metadata.create_all(bind=engine)
     ensure_schema()
     if settings.SEED_ON_START:

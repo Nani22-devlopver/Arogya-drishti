@@ -7,11 +7,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # PostgreSQL only: local Postgres, or Supabase cloud (paste its connection string into DATABASE_URL).
-    DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/aarogya_drishti"
+    DATABASE_URL: str = ""
     JWT_SECRET: str = "local-demo-secret-not-for-production"
     JWT_EXPIRE_MINUTES: int = 480
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://localhost:8080"
+    # Images are stored in Supabase Storage (private bucket). STORAGE_DIR is only used by migrate_local_images.py.
     STORAGE_DIR: str = str(Path(__file__).resolve().parents[1] / "storage")
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_ROLE_KEY: str = ""
+    SUPABASE_BUCKET: str = "patient-images"
     AI_FORCE_FAIL: bool = False
     SEED_ON_START: bool = True
     # Also insert synthetic cases at every workflow stage so the medical officer, specialist and navigator pages

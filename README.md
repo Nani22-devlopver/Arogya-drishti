@@ -1,3 +1,5 @@
+> **Stage 6 edition: DB + images on Supabase. Start with SUPABASE_SETUP.md.**
+
 # Aarogya Drishti
 
 Synthetic-data oral screening demo for **AAROHAN Hackathon 2026** (ITDA Paderu).
