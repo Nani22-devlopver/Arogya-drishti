@@ -158,3 +158,13 @@ form button[type=submit]{margin-top:16px}
 }
 @media print{.banner,.sidebar,.topbar,.toasts,button{display:none!important}.card{box-shadow:none}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* AI feedback */
+.ai-box{border:1px solid var(--line);border-left:4px solid var(--teal);background:#f8fcfe;border-radius:14px;padding:14px 16px;margin:12px 0}
+.ai-head{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px}
+.ai-block{margin:10px 0}
+.ai-block h4{margin:0 0 4px;font-size:13px;letter-spacing:.02em;color:var(--teal-dark)}
+.ai-block ul{margin:0;padding-left:18px;font-size:14px}
+.ai-block p{margin:0;font-size:14px}
+.ai-retake{background:var(--danger-soft);color:var(--danger);padding:8px 12px;border-radius:10px;font-size:14px;margin:8px 0}
+.ai-disclaimer{border-top:1px dashed var(--line);padding-top:8px;margin-top:10px}

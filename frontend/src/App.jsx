@@ -49,6 +49,113 @@ function tone(status = "") {
   return "neutral";
 }
 const Pill = ({ children, kind }) => <span className={`pill ${kind || tone(children)}`}>{children}</span>;
+// The backend accepts JPEG/PNG/WEBP. Browsers can decode others (AVIF, HEIC on Safari), so convert to JPEG first.
+async function toUploadable(file) {
+  if (/^image\/(jpeg|jpg|png|webp)$/i.test(file.type)) return file;
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d").drawImage(bitmap, 0, 0);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+  if (!blob) throw new Error("This image format could not be converted. Please use a JPG or PNG photo.");
+  return new File([blob], file.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+}
+
+const AI_LABELS = {
+  suspicious_example: { text: "Needs clinician attention", kind: "warn" },
+  no_suspicious_finding_example: { text: "Nothing notable visible", kind: "ok" },
+  inconclusive_example: { text: "Inconclusive", kind: "neutral" },
+};
+const URGENCY_KIND = { urgent: "bad", soon: "warn", routine: "ok" };
+
+function BulletList({ title, items }) {
+  if (!items?.length) return null;
+  return (
+    <div className="ai-block">
+      <h4>{title}</h4>
+      <ul>
+        {items.map((x, i) => (
+          <li key={i}>{x}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+// Structured feedback returned by the backend after it sent the photo to Ollama Cloud.
+// audience: "worker" (field health worker) or "clinician" (reviewing doctor).
+function AiFeedback({ analysis, audience = "worker" }) {
+  const { lang } = useI18n();
+  if (!analysis) return null;
+  const fb = analysis.feedback;
+  if (analysis.status === "failed") {
+    return (
+      <p className="warn">
+        AI analysis failed{fb?.error ? `: ${fb.error}` : ""}. The case is preserved for manual clinician review.
+      </p>
+    );
+  }
+  if (analysis.status === "image_insufficient" && !fb) {
+    return (
+      <p className="warn">
+        This photo did not pass the quality check, so it was not sent to the AI. See the photo status above (for example
+        unsupported_type, blurry, too_small, underexposed) and upload a new photo.
+      </p>
+    );
+  }
+  if (!fb) {
+    return (
+      <p className="warn">
+        {analysis.research_label || analysis.status} · {analysis.model_version} · {analysis.warning}
+      </p>
+    );
+  }
+  const label = AI_LABELS[analysis.research_label] || { text: analysis.research_label || analysis.status, kind: "neutral" };
+  const usable = fb.image_assessment?.usable !== false;
+  const patientText = fb.patient_message?.[lang] || fb.patient_message?.en;
+  return (
+    <div className="ai-box">
+      <div className="ai-head">
+        <Pill kind={label.kind}>{label.text}</Pill>
+        {usable && fb.suggested_urgency && <Pill kind={URGENCY_KIND[fb.suggested_urgency]}>Suggested: {fb.suggested_urgency}</Pill>}
+        {fb.confidence && <Pill kind="neutral">Confidence: {fb.confidence}</Pill>}
+        <span className="small">{analysis.provider} · {analysis.model_version}</span>
+      </div>
+      {!usable && (
+        <div className="ai-retake">
+          <b>Photo cannot be assessed – please retake.</b>
+        </div>
+      )}
+      <BulletList title="Photo issues" items={fb.image_assessment?.issues} />
+      <BulletList title="How to retake the photo" items={fb.recapture_tips} />
+      <BulletList title="What the AI can see" items={fb.observations} />
+      {audience === "clinician" ? (
+        <>
+          {fb.clinician_summary && (
+            <div className="ai-block">
+              <h4>Summary for the reviewing clinician</h4>
+              <p>{fb.clinician_summary}</p>
+            </div>
+          )}
+          <BulletList title="Field-worker guidance given" items={fb.health_worker_guidance} />
+        </>
+      ) : (
+        <>
+          <BulletList title="Next steps for the health worker" items={fb.health_worker_guidance} />
+          {patientText && (
+            <div className="ai-block">
+              <h4>Message for the patient</h4>
+              <p>{patientText}</p>
+            </div>
+          )}
+        </>
+      )}
+      {fb.limitations && <p className="small">{fb.limitations}</p>}
+      <p className="small ai-disclaimer">{analysis.warning} · Advisory only – a clinician makes the decision.</p>
+    </div>
+  );
+}
 function Empty({ icon = "inbox", text = "Nothing here yet" }) {
   return (
     <div className="empty">
@@ -459,6 +566,7 @@ function PatientProfile() {
   const [msg, setMsg] = useState("");
   const [preview, setPreview] = useState("");
   const [view, setView] = useState("cheek");
+  const [analyzing, setAnalyzing] = useState(false);
   const consentCopy = {
     examination: t.consentExam,
     imaging: t.consentImage,
@@ -494,21 +602,48 @@ function PatientProfile() {
     setDetail(await api(`/screenings/${s.id}`));
   }
   async function upload(e) {
-    const file = e.target.files?.[0];
-    if (!file || !sid) return;
-    setPreview(URL.createObjectURL(file));
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("view", view);
-    const r = await api(`/screenings/${sid}/images`, { method: "POST", body: fd });
-    setMsg(`Image quality: ${r.quality_status} ${r.quality_reason || ""}. ${r.warning || ""}`);
-    setDetail(await api(`/screenings/${sid}`));
+    const picked = e.target.files?.[0];
+    if (!picked || !sid) return;
+    try {
+      const file = await toUploadable(picked);
+      setPreview(URL.createObjectURL(file));
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("view", view);
+      const r = await api(`/screenings/${sid}/images`, { method: "POST", body: fd });
+      setMsg(
+        r.quality_status === "pending_ai"
+          ? "Photo uploaded. The AI will check the photo quality when you analyse it."
+          : `Image quality: ${r.quality_status} ${r.quality_reason || ""}. ${r.warning || ""}`
+      );
+      setDetail(await api(`/screenings/${sid}`));
+    } catch (err) {
+      setMsg(err.message || "Upload failed");
+    }
   }
   async function analyze() {
-    const imageId = detail?.images?.[0]?.id;
-    const r = await api("/ai/analyze", { method: "POST", body: JSON.stringify({ screening_id: sid, image_id: imageId }) });
-    setMsg(`AI (research only): ${r.research_label || r.status}. ${r.warning}`);
-    setDetail(await api(`/screenings/${sid}`));
+    const imgs = detail?.images || [];
+    if (!imgs.length) {
+      setMsg("Upload a photo first.");
+      return;
+    }
+    const target = [...imgs].reverse().find((im) => im.quality_status === "acceptable") || imgs[imgs.length - 1];
+    setAnalyzing(true);
+    setMsg("Sending the photo to the AI service… this can take up to a minute.");
+    try {
+      const r = await api("/ai/analyze", { method: "POST", body: JSON.stringify({ screening_id: sid, image_id: target.id }) });
+      if (r.status === "image_insufficient") {
+        setMsg("The AI could not assess this photo. See the feedback below on how to retake it.");
+      } else {
+        setMsg(`AI feedback ready (${r.provider}, research only). ${r.warning}`);
+      }
+      setDetail(await api(`/screenings/${sid}`));
+    } catch (e) {
+      setMsg(e.message);
+      setDetail(await api(`/screenings/${sid}`).catch(() => detail));
+    } finally {
+      setAnalyzing(false);
+    }
   }
   if (!p) return msg ? <div className="card err">{msg}</div> : <Loading />;
   const stepNo = !sid ? (consents.length ? 2 : 1) : detail?.ai_analyses?.length ? 5 : detail?.images?.length ? 4 : 3;
@@ -589,7 +724,7 @@ function PatientProfile() {
                 {preview && <img className="preview" alt="preview" src={preview} />}
                 <div className="row">
                   <button className="secondary" onClick={() => { setPreview(""); }}>{t.retake}</button>
-                  <button onClick={analyze}>{t.analyze}</button>
+                  <button onClick={analyze} disabled={analyzing || !detail?.images?.length}>{analyzing ? "Analysing photo…" : t.analyze}</button>
                 </div>
               </>
             )}
@@ -600,11 +735,16 @@ function PatientProfile() {
                     {im.view}: <Pill>{im.quality_status}</Pill> {im.quality_reason || ""}
                   </p>
                 ))}
-                {(detail.ai_analyses || []).map((a) => (
-                  <p key={a.id} className="warn">
-                    {a.research_label || a.status} · {a.model_version} · {a.warning}
+              </div>
+            )}
+            {detail && (detail.ai_analyses || []).length > 0 && (
+              <div>
+                {detail.ai_analyses.slice(0, -1).map((a) => (
+                  <p key={a.id} className="small">
+                    Earlier run: {a.research_label || a.status} · {a.model_version}
                   </p>
                 ))}
+                <AiFeedback analysis={detail.ai_analyses[detail.ai_analyses.length - 1]} audience="worker" />
               </div>
             )}
           </div>
@@ -680,7 +820,9 @@ function Reviews() {
       {sel && (
         <div className="card">
           <p className="warn">AI is advisory and nonclinical. Your signed note is independent.</p>
-          <pre className="small">{JSON.stringify(sel.ai_analyses, null, 2)}</pre>
+          {(sel.ai_analyses || []).length === 0 ? <p className="small">No AI analysis for this screening.</p> : (
+            sel.ai_analyses.map((a) => <AiFeedback key={a.id} analysis={a} audience="clinician" />)
+          )}
           <div className="row">
             {sel.images.map((im) => (
               <img key={im.id} className="photo" alt="" src={`/api/screenings/${sel.id}/images/${im.id}/file?access_token=${getToken()}`} />

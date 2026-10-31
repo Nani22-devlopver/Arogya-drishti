@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
@@ -30,7 +31,8 @@ from .models import (
 from .security import bearer, create_token, current_user, decode_token, require_roles, verify_password
 
 from .ai.mock_adapter import analyze as mock_analyze
-from .ai.quality import check_quality
+from .ai.ollama_adapter import OllamaError, analyze as ollama_analyze
+from .ai.quality import MAX_BYTES, QualityResult, check_quality
 
 router = APIRouter()
 storage = Path(settings.STORAGE_DIR)
@@ -165,6 +167,15 @@ def has_consent(db: Session, patient_id: str, purpose: str) -> bool:
         .first()
         is not None
     )
+
+
+def parse_feedback(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 @router.get("/healthz")
@@ -374,8 +385,8 @@ def get_screening(screening_id: str, db: Session = Depends(get_db), user: User =
     if not s:
         raise HTTPException(404, "Screening not found")
     assert_screening_access(db, user, s)
-    images = db.query(ImageRecord).filter(ImageRecord.screening_id == s.id).all()
-    ai = db.query(AiAnalysis).filter(AiAnalysis.screening_id == s.id).all()
+    images = db.query(ImageRecord).filter(ImageRecord.screening_id == s.id).order_by(ImageRecord.created_at).all()
+    ai = db.query(AiAnalysis).filter(AiAnalysis.screening_id == s.id).order_by(AiAnalysis.created_at).all()
     reviews = db.query(ClinicalReview).filter(ClinicalReview.screening_id == s.id).all()
     return {
         "id": s.id,
@@ -403,6 +414,7 @@ def get_screening(screening_id: str, db: Session = Depends(get_db), user: User =
                 "provider": a.provider,
                 "warning": a.warning,
                 "clinical_use": a.clinical_use,
+                "feedback": parse_feedback(a.feedback),
             }
             for a in ai
         ],
@@ -434,7 +446,15 @@ def upload_image(
     if not has_consent(db, s.patient_id, "imaging"):
         raise HTTPException(400, "Imaging consent is required before photograph upload")
     data = file.file.read()
-    quality = check_quality(data, file.content_type)
+    if settings.LOCAL_QUALITY_CHECK:
+        quality = check_quality(data, file.content_type)
+    else:
+        # No local gate: the AI decides whether the photo is good enough. Only reject files that cannot be processed at all.
+        if not data:
+            raise HTTPException(400, "The uploaded file is empty")
+        if len(data) > MAX_BYTES:
+            raise HTTPException(400, "The photo is larger than 8 MB; please upload a smaller one")
+        quality = QualityResult("pending_ai", None)
     checksum = hashlib.sha256(data).hexdigest()
     image_id = uid()
     path = storage / f"{image_id}.bin"
@@ -494,6 +514,24 @@ def download_image(
     return FileResponse(path, media_type="application/octet-stream")
 
 
+def _record_failed_analysis(db: Session, s: Screening, image_id: str | None, provider: str, model: str, user: User, event: str, reason: str | None = None) -> AiAnalysis:
+    rec = AiAnalysis(
+        feedback=json.dumps({"error": reason}, ensure_ascii=False) if reason else None,
+        screening_id=s.id,
+        image_id=image_id,
+        model_version=model[:40],
+        provider=provider,
+        status="failed",
+        research_label=None,
+    )
+    db.add(rec)
+    db.flush()
+    s.status = "AWAITING_CLINICIAN"
+    audit(db, user.id, event, f"screening:{s.id}")
+    db.commit()
+    return rec
+
+
 @router.post("/ai/analyze")
 def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
     if user.role not in {"health_worker", "medical_officer"}:
@@ -502,19 +540,11 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
     if not s:
         raise HTTPException(404, "Screening not found")
     assert_screening_access(db, user, s)
+    use_ollama = settings.use_ollama
+    provider_name = "ollama" if use_ollama else "mock"
+    model_name = settings.OLLAMA_MODEL if use_ollama else "mock-v1"
     if settings.AI_FORCE_FAIL:
-        rec = AiAnalysis(
-            screening_id=s.id,
-            image_id=body.image_id,
-            model_version="mock-v1",
-            provider="mock",
-            status="failed",
-            research_label=None,
-        )
-        db.add(rec)
-        s.status = "AWAITING_CLINICIAN"
-        audit(db, user.id, "ai.fail", f"screening:{s.id}")
-        db.commit()
+        rec = _record_failed_analysis(db, s, body.image_id, provider_name, model_name, user, "ai.fail")
         raise HTTPException(
             503,
             detail={
@@ -527,21 +557,21 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
     image = None
     if body.image_id:
         image = db.get(ImageRecord, body.image_id)
+        if image and image.screening_id != s.id:
+            raise HTTPException(404, "Image not found for this screening")
     else:
-        image = (
-            db.query(ImageRecord)
-            .filter(ImageRecord.screening_id == s.id, ImageRecord.quality_status == "acceptable")
-            .order_by(ImageRecord.created_at.desc())
-            .first()
-        )
+        q = db.query(ImageRecord).filter(ImageRecord.screening_id == s.id)
+        if settings.LOCAL_QUALITY_CHECK:
+            q = q.filter(ImageRecord.quality_status == "acceptable")
+        image = q.order_by(ImageRecord.created_at.desc()).first()
     if not image:
-        raise HTTPException(400, "No acceptable image available for demonstration analysis")
-    if image.quality_status != "acceptable":
+        raise HTTPException(400, "No photo available for analysis. Upload a photo first.")
+    if settings.LOCAL_QUALITY_CHECK and image.quality_status != "acceptable":
         rec = AiAnalysis(
             screening_id=s.id,
             image_id=image.id,
-            model_version="mock-v1",
-            provider="mock",
+            model_version=model_name[:40],
+            provider=provider_name,
             status="image_insufficient",
             research_label=None,
         )
@@ -551,28 +581,71 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
             "analysis_id": rec.id,
             "status": "image_insufficient",
             "image_quality": image.quality_status,
+            "image_quality_reason": image.quality_reason,
             "clinical_use": False,
             "warning": "NOT FOR CLINICAL USE",
         }
-    raw = (storage / image.storage_key).read_bytes()
-    result = mock_analyze(raw, s.id)
+    path = storage / image.storage_key
+    if not path.exists():
+        raise HTTPException(404, "Stored file missing")
+    raw = path.read_bytes()
+
+    if use_ollama:
+        patient = db.get(Patient, s.patient_id)
+        context = {
+            "view": image.view,
+            "age": patient.age if patient else None,
+            "sex": patient.sex if patient else None,
+            "symptoms": s.symptoms,
+            "duration": s.duration,
+            "tobacco": s.tobacco,
+            "exam_notes": s.exam_notes,
+        }
+        try:
+            result = ollama_analyze(raw, s.id, context)
+        except OllamaError as exc:
+            rec = _record_failed_analysis(db, s, image.id, "ollama", model_name, user, "ai.fail", reason=str(exc))
+            raise HTTPException(
+                503,
+                detail={
+                    "message": f"AI analysis unavailable: {exc}. Screening is preserved for manual clinician review.",
+                    "analysis_id": rec.id,
+                    "status": "failed",
+                    "clinical_use": False,
+                },
+            )
+    else:
+        result = mock_analyze(raw, s.id)
+        result.setdefault("status", "completed")
+        result.setdefault("feedback", None)
+
     rec = AiAnalysis(
         screening_id=s.id,
         image_id=image.id,
         model_version=result["model_version"],
         provider=result["provider"],
         research_label=result["research_label"],
-        status="completed",
+        status=result["status"],
         warning=result["warning"],
         clinical_use=False,
+        feedback=json.dumps(result["feedback"], ensure_ascii=False) if result.get("feedback") else None,
     )
     db.add(rec)
+    db.flush()
+    fb = result.get("feedback") or {}
+    if not settings.LOCAL_QUALITY_CHECK and fb.get("image_assessment"):
+        # Show the AI's quality verdict on the photo instead of a local blur/size result.
+        assess = fb["image_assessment"]
+        image.quality_status = "acceptable" if assess.get("usable", True) else "recapture"
+        issues = assess.get("issues") or []
+        image.quality_reason = str(issues[0])[:80] if (issues and not assess.get("usable", True)) else None
     s.status = "AWAITING_CLINICIAN"
     audit(db, user.id, "ai.analyze", f"analysis:{rec.id}")
     db.commit()
     return {
         "analysis_id": rec.id,
         "screening_id": s.id,
+        "status": rec.status,
         "image_quality": image.quality_status,
         "provider": rec.provider,
         "model_version": rec.model_version,
@@ -581,6 +654,7 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
         "clinical_use": False,
         "requires_clinician_review": True,
         "warning": rec.warning,
+        "feedback": result.get("feedback"),
     }
 
 

@@ -103,6 +103,7 @@ class AiAnalysis(Base):
     status: Mapped[str] = mapped_column(String(40), default="completed")
     warning: Mapped[str] = mapped_column(String(120), default="NOT FOR CLINICAL USE")
     clinical_use: Mapped[bool] = mapped_column(Boolean, default=False)
+    feedback: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON from the vision model
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

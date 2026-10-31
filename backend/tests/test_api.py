@@ -15,6 +15,7 @@ os.environ["DATABASE_URL"] = os.getenv(
     "postgresql+psycopg2://postgres:postgres@localhost:5432/aarogya_drishti_test",
 )
 os.environ["SEED_ON_START"] = "true"
+os.environ["LOCAL_QUALITY_CHECK"] = "true"  # existing tests exercise the local gate; see test_ai_judges_quality_when_local_check_off
 os.environ["JWT_SECRET"] = "test-secret-not-for-production-use-32b"
 os.environ["STORAGE_DIR"] = str(ROOT / "storage-test")
 
@@ -200,3 +201,156 @@ def test_consent_gate_and_journey():
 def test_wrong_password():
     r = client.post("/auth/login", json={"email": "hw@demo.local", "password": "wrong"})
     assert r.status_code == 401
+
+
+def _journey_to_image(hw, name: str, phone: str):
+    p = client.post(
+        "/patients",
+        headers={**hw, "Idempotency-Key": f"p-{name}"},
+        json={"full_name": name, "age": 52, "sex": "male", "phone": phone, "village": "Test", "tobacco_use": "gutka"},
+    )
+    assert p.status_code == 200, p.text
+    pid = p.json()["id"]
+    for purpose in ("examination", "imaging"):
+        assert client.post(f"/patients/{pid}/consents", headers=hw, json={"purpose": purpose}).status_code == 200
+    s = client.post(
+        "/screenings",
+        headers={**hw, "Idempotency-Key": f"s-{name}"},
+        json={"patient_id": pid, "symptoms": "sore for 3 weeks", "tobacco": "gutka daily"},
+    )
+    sid = s.json()["id"]
+    img = client.post(
+        f"/screenings/{sid}/images",
+        headers=hw,
+        files={"file": ("photo.jpg", make_image(), "image/jpeg")},
+        data={"view": "cheek"},
+    )
+    assert img.status_code == 200, img.text
+    return sid, img.json()["id"]
+
+
+def test_ollama_feedback_is_stored_and_returned(monkeypatch):
+    from app import routers
+    from app.ai import ollama_adapter
+
+    seen = {}
+
+    def fake_ollama(raw, screening_id, context):
+        seen["bytes"] = len(raw)
+        seen["context"] = context
+        return {
+            "provider": "ollama",
+            "model_version": "fake-vision:1",
+            "status": "completed",
+            "research_label": "suspicious_example",
+            "score": None,
+            "clinical_use": False,
+            "requires_clinician_review": True,
+            "warning": "NOT FOR CLINICAL USE",
+            "screening_id": screening_id,
+            "feedback": {
+                "observations": ["White patch on cheek"],
+                "suggested_urgency": "soon",
+                "clinician_summary": "Examine the left cheek.",
+                "patient_message": {"en": "Please see a doctor soon.", "te": "త్వరగా డాక్టర్‌ని కలవండి."},
+            },
+        }
+
+    monkeypatch.setattr(routers.settings, "AI_PROVIDER", "ollama")
+    monkeypatch.setattr(routers, "ollama_analyze", fake_ollama)
+
+    hw = auth("hw@demo.local")
+    sid, image_id = _journey_to_image(hw, "Ollama Patient", "9222222222")
+    r = client.post("/ai/analyze", headers=hw, json={"screening_id": sid, "image_id": image_id})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"] == "ollama"
+    assert body["clinical_use"] is False and body["requires_clinician_review"] is True
+    assert body["feedback"]["suggested_urgency"] == "soon"
+    # the backend, not the browser, read the stored photo and passed patient context along
+    assert seen["bytes"] > 1000
+    assert seen["context"]["view"] == "cheek" and seen["context"]["age"] == 52
+    assert "full_name" not in seen["context"] and "phone" not in seen["context"]
+
+    detail = client.get(f"/screenings/{sid}", headers=hw).json()
+    assert detail["ai_analyses"][-1]["feedback"]["observations"] == ["White patch on cheek"]
+
+
+def test_ollama_failure_preserves_screening(monkeypatch):
+    from app import routers
+    from app.ai.ollama_adapter import OllamaError
+
+    def boom(*_a, **_k):
+        raise OllamaError("Ollama Cloud timed out")
+
+    monkeypatch.setattr(routers.settings, "AI_PROVIDER", "ollama")
+    monkeypatch.setattr(routers, "ollama_analyze", boom)
+
+    hw = auth("hw@demo.local")
+    sid, image_id = _journey_to_image(hw, "Ollama Fail Patient", "9333333333")
+    r = client.post("/ai/analyze", headers=hw, json={"screening_id": sid, "image_id": image_id})
+    assert r.status_code == 503
+    assert r.json()["detail"]["status"] == "failed"
+    detail = client.get(f"/screenings/{sid}", headers=hw).json()
+    assert detail["status"] == "AWAITING_CLINICIAN"
+    assert detail["ai_analyses"][-1]["status"] == "failed"
+
+
+def test_cannot_analyze_image_from_another_screening():
+    hw = auth("hw@demo.local")
+    sid_a, _ = _journey_to_image(hw, "Owner A", "9444444444")
+    _sid_b, image_b = _journey_to_image(hw, "Owner B", "9555555555")
+    r = client.post("/ai/analyze", headers=hw, json={"screening_id": sid_a, "image_id": image_b})
+    assert r.status_code == 404
+
+
+def test_ai_judges_quality_when_local_check_off(monkeypatch):
+    from app import routers
+
+    monkeypatch.setattr(routers.settings, "LOCAL_QUALITY_CHECK", False)
+    monkeypatch.setattr(routers.settings, "AI_PROVIDER", "ollama")
+
+    def fake_ollama(raw, screening_id, context):
+        usable = context["view"] != "tongue"
+        return {
+            "provider": "ollama",
+            "model_version": "fake-vision:1",
+            "status": "completed" if usable else "image_insufficient",
+            "research_label": "no_suspicious_finding_example" if usable else "inconclusive_example",
+            "score": None,
+            "clinical_use": False,
+            "requires_clinician_review": True,
+            "warning": "NOT FOR CLINICAL USE",
+            "screening_id": screening_id,
+            "feedback": {
+                "image_assessment": {"is_oral_photo": usable, "usable": usable, "issues": [] if usable else ["too dark"]},
+                "recapture_tips": [] if usable else ["Use more light"],
+            },
+        }
+
+    monkeypatch.setattr(routers, "ollama_analyze", fake_ollama)
+
+    hw = auth("hw@demo.local")
+    sid, image_id = _journey_to_image(hw, "No Gate Patient", "9666666666")
+    detail = client.get(f"/screenings/{sid}", headers=hw).json()
+    # a blurry photo is no longer rejected locally
+    blur = client.post(
+        f"/screenings/{sid}/images",
+        headers=hw,
+        files={"file": ("blur.jpg", make_image(blur=True), "image/jpeg")},
+        data={"view": "tongue"},
+    )
+    assert blur.status_code == 200 and blur.json()["quality_status"] == "pending_ai"
+
+    ok = client.post("/ai/analyze", headers=hw, json={"screening_id": sid, "image_id": image_id})
+    assert ok.status_code == 200 and ok.json()["status"] == "completed"
+
+    bad = client.post("/ai/analyze", headers=hw, json={"screening_id": sid, "image_id": blur.json()["id"]})
+    assert bad.status_code == 200
+    assert bad.json()["status"] == "image_insufficient"
+    assert bad.json()["feedback"]["recapture_tips"] == ["Use more light"]
+
+    images = {i["id"]: i for i in client.get(f"/screenings/{sid}", headers=hw).json()["images"]}
+    assert images[image_id]["quality_status"] == "acceptable"
+    assert images[blur.json()["id"]]["quality_status"] == "recapture"
+    assert images[blur.json()["id"]]["quality_reason"] == "too dark"

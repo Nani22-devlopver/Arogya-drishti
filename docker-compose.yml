@@ -22,6 +22,10 @@ services:
       JWT_SECRET: ${JWT_SECRET:-local-demo-secret-not-for-production}
       STORAGE_DIR: /data/storage
       SEED_ON_START: "true"
+      AI_PROVIDER: ${AI_PROVIDER:-auto}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4}
+      OLLAMA_FALLBACK_MODEL: ${OLLAMA_FALLBACK_MODEL:-}
       CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080
     ports:
       - "8000:8000"

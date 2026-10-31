@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .db import Base, SessionLocal, engine
+from .db import Base, SessionLocal, engine, ensure_schema
 from .routers import router
 from .seed import seed_if_empty
 
@@ -12,6 +12,7 @@ from .seed import seed_if_empty
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_schema()
     if settings.SEED_ON_START:
         db = SessionLocal()
         try:

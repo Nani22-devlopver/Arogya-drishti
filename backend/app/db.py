@@ -14,6 +14,17 @@ class Base(DeclarativeBase):
     pass
 
 
+def ensure_schema() -> None:
+    """Tiny forward-only migration so an existing database picks up new columns.
+
+    Base.metadata.create_all() creates missing tables but never alters existing ones.
+    """
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS feedback TEXT"))
+
+
 def get_db():
     db = SessionLocal()
     try:
