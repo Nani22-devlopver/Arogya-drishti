@@ -1,6 +1,9 @@
 import hashlib
 import json
+import re
 from pathlib import Path
+
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
@@ -28,7 +31,7 @@ from .models import (
     User,
     uid,
 )
-from .security import bearer, create_token, current_user, decode_token, require_roles, verify_password
+from .security import bearer, create_token, current_user, decode_token, hash_password, require_roles, verify_password
 
 from .ai.mock_adapter import analyze as mock_analyze
 from .ai.ollama_adapter import OllamaError, analyze as ollama_analyze
@@ -98,11 +101,15 @@ class AppointmentIn(BaseModel):
     kind: str = "physical"
     slot: str
     status: str = "REQUESTED"
+    meet_url: str | None = None  # Google Meet link, required for video consultations
+    start_now: bool = False  # specialists only: start the Meet immediately instead of scheduling
 
 
 class AppointmentPatch(BaseModel):
     status: str
     attendance_outcome: str | None = None
+    slot: str | None = None  # new time when rescheduling
+    meet_url: str | None = None  # add or replace the Google Meet link
 
 
 class InvestigationIn(BaseModel):
@@ -122,6 +129,14 @@ class NavPatch(BaseModel):
     due: str | None = None
 
 
+class RegisterIn(BaseModel):
+    full_name: str
+    email: str
+    password: str
+    role: str
+    assigned_facility: str | None = None
+
+
 class AnalyzeIn(BaseModel):
     screening_id: str
     image_id: str | None = None
@@ -134,6 +149,8 @@ def user_out(u: User) -> dict:
         "full_name": u.full_name,
         "role": u.role,
         "assigned_facility": u.assigned_facility,
+        "status": u.status,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
     }
 
 
@@ -188,9 +205,49 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email.lower()).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
+    if user.status == "pending":
+        raise HTTPException(403, "Your registration is awaiting admin approval. You can sign in once it is approved.")
+    if user.status == "rejected":
+        raise HTTPException(403, "Your registration was not approved. Please contact the district admin.")
+    if user.status != "active":
+        raise HTTPException(403, "This account is not active.")
     audit(db, user.id, "login", f"user:{user.id}")
     db.commit()
     return {"token": create_token(user), "user": user_out(user)}
+
+
+SELF_REGISTER_ROLES = {"health_worker", "navigator", "medical_officer", "specialist"}
+
+
+@router.post("/auth/register", status_code=201)
+def register_account(body: RegisterIn, db: Session = Depends(get_db)):
+    """Public self-registration. The account stays `pending` until an admin approves it."""
+    email = body.email.strip().lower()
+    name = body.full_name.strip()
+    if body.role not in SELF_REGISTER_ROLES:
+        raise HTTPException(422, "Choose a valid designation")
+    if len(name) < 2 or "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(422, "Enter your full name and a valid email")
+    if len(body.password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(409, "An account with this email already exists")
+    user = User(
+        email=email,
+        full_name=name,
+        password_hash=hash_password(body.password),
+        role=body.role,
+        assigned_facility=(body.assigned_facility or "").strip() or "PHC G. Madugula",
+        status="pending",
+    )
+    db.add(user)
+    db.flush()
+    label = body.role.replace("_", " ")
+    for admin in db.query(User).filter(User.role == "admin", User.status == "active").all():
+        notify(db, admin.id, "New registration awaiting approval", f"{name} applied as {label}. Review it under Pending approvals.")
+    audit(db, user.id, "user.register", f"user:{user.id}", json.dumps({"role": body.role}))
+    db.commit()
+    return {"ok": True, "status": "pending", "message": "Registration received. An admin must approve it before you can sign in."}
 
 
 @router.get("/auth/me")
@@ -769,6 +826,106 @@ def get_referral(referral_id: str, db: Session = Depends(get_db), user: User = D
     return referral_out(rec, db.get(Patient, rec.patient_id))
 
 
+MEET_RE = re.compile(r"^https://meet\.google\.com/(?:lookup/)?[A-Za-z0-9_-]{3,40}(?:-[A-Za-z0-9_-]{2,40}){0,3}(?:\?[^\s#]*)?$")
+
+
+def clean_meet_url(url: str | None) -> str:
+    url = (url or "").strip()
+    if not MEET_RE.match(url):
+        raise HTTPException(422, "Enter a valid Google Meet link, for example https://meet.google.com/abc-defg-hij")
+    return url
+
+
+# ---------- appointment / video-call notifications ----------
+
+def parse_slot(slot: str | None) -> datetime | None:
+    """Slots are ISO strings from the scheduler. Older free-text slots return None."""
+    if not slot:
+        return None
+    try:
+        dt = datetime.fromisoformat(slot.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def fmt_slot(slot: str | None) -> str:
+    """Human text with the weekday, kept in the time zone the scheduler chose, e.g. 'Mon, 02 Nov 2026, 10:00 (UTC+05:30)'."""
+    dt = parse_slot(slot)
+    if not dt:
+        return slot or "time to be confirmed"
+    off = dt.strftime("%z")
+    return f"{dt.strftime('%a, %d %b %Y, %H:%M')} (UTC{off[:3]}:{off[3:]})"
+
+
+def appointment_parties(db: Session, ref: Referral) -> dict[str, set[str]]:
+    """Who should hear about an appointment, grouped by role. Names/clinical details are never sent."""
+    parties: dict[str, set[str]] = {"health_worker": set(), "medical_officer": set(), "navigator": set(), "specialist": set()}
+    review = db.get(ClinicalReview, ref.review_id)
+    screening = db.get(Screening, review.screening_id) if review else None
+    patient = db.get(Patient, ref.patient_id)
+    if screening and screening.examiner_id:
+        parties["health_worker"].add(screening.examiner_id)
+    if patient and patient.created_by:
+        parties["health_worker"].add(patient.created_by)
+    if review and review.doctor_id:
+        parties["medical_officer"].add(review.doctor_id)
+    for role in ("navigator", "specialist"):
+        for u in db.query(User).filter(User.role == role, User.status == "active").all():
+            parties[role].add(u.id)
+    if not parties["health_worker"] and patient:
+        for u in db.query(User).filter(User.role == "health_worker", User.status == "active", User.assigned_facility == patient.facility).all():
+            parties["health_worker"].add(u.id)
+    return parties
+
+
+def notify_appointment(db: Session, rec: Appointment, actor: User, title: str, body: str, roles: set[str] | None = None, dedupe_minutes: int = 0) -> int:
+    ref = db.get(Referral, rec.referral_id)
+    if not ref:
+        return 0
+    tag = f" [appt:{rec.id}]"
+    sent = 0
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=dedupe_minutes)
+    seen: set[str] = set()
+    for role, ids in appointment_parties(db, ref).items():
+        if roles is not None and role not in roles:
+            continue
+        for uid_ in ids:
+            if uid_ == actor.id or uid_ in seen:
+                continue
+            seen.add(uid_)
+            if dedupe_minutes and (
+                db.query(Notification)
+                .filter(Notification.user_id == uid_, Notification.title == title, Notification.body.like(f"%{rec.id}%"), Notification.created_at >= cutoff)
+                .first()
+            ):
+                continue
+            notify(db, uid_, title, (body[: 255 - len(tag)] + tag))
+            sent += 1
+    return sent
+
+
+def make_call_reminders(db: Session, user: User) -> None:
+    """Lazy 'starting soon' reminders: created when the user's notifications are fetched."""
+    now = datetime.now(timezone.utc)
+    rows = db.query(Appointment).filter(Appointment.kind == "video", Appointment.status.in_(["REQUESTED", "CONFIRMED", "RESCHEDULED"])).all()
+    changed = False
+    for a in rows:
+        dt = parse_slot(a.slot)
+        if not dt or not (now - timedelta(minutes=15) <= dt <= now + timedelta(minutes=30)):
+            continue
+        ref = db.get(Referral, a.referral_id)
+        if not ref or user.id not in set().union(*appointment_parties(db, ref).values()):
+            continue
+        title = "Video consultation starting soon"
+        exists = db.query(Notification).filter(Notification.user_id == user.id, Notification.title == title, Notification.body.like(f"%{a.id}%")).first()
+        if not exists:
+            notify(db, user.id, title, f"Scheduled for {fmt_slot(a.slot)}. Be ready to join. [appt:{a.id}]")
+            changed = True
+    if changed:
+        db.commit()
+
+
 @router.post("/appointments")
 def create_appointment(
     body: AppointmentIn,
@@ -778,12 +935,29 @@ def create_appointment(
     ref = db.get(Referral, body.referral_id)
     if not ref:
         raise HTTPException(404, "Referral not found")
+    if body.kind not in {"video", "physical"}:
+        raise HTTPException(422, "Unknown appointment type")
+    if body.start_now:
+        if user.role != "specialist":
+            raise HTTPException(403, "Only a specialist can start a video consultation immediately")
+        if body.kind != "video":
+            raise HTTPException(422, "Only video consultations can be started immediately")
+        slot = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        status = "CONFIRMED"
+    else:
+        slot = body.slot
+        status = body.status
+        if parse_slot(slot) is None:
+            raise HTTPException(422, "Pick a valid date and time")
+    meet_url = clean_meet_url(body.meet_url) if body.kind == "video" else None
     rec = Appointment(
         referral_id=ref.id,
         kind=body.kind,
-        slot=body.slot,
-        status=body.status,
-        video_ref=f"aarogya-{uid()[:8]}" if body.kind == "video" else None,
+        slot=slot,
+        status=status,
+        video_provider="google_meet",
+        video_url=meet_url,
+        video_ref=meet_url.rsplit("/", 1)[-1].split("?")[0] if meet_url else None,
     )
     db.add(rec)
     s = db.query(Screening).join(ClinicalReview, ClinicalReview.screening_id == Screening.id).filter(
@@ -791,10 +965,15 @@ def create_appointment(
     ).first()
     if s:
         s.status = "APPOINTED"
-    nav = db.query(User).filter(User.role == "navigator").first()
-    if nav:
-        notify(db, nav.id, "Appointment scheduled", "An appointment was booked. No clinical details included.")
-    audit(db, user.id, "appointment.create", f"appointment:{rec.id}")
+    db.flush()
+    label = "Video consultation" if rec.kind == "video" else "Hospital appointment"
+    if body.start_now:
+        notify_appointment(db, rec, user, "Video consultation is live", "The specialist has started the Google Meet call. Join now with the patient.", roles={"health_worker", "medical_officer", "navigator"})
+        audit(db, user.id, "appointment.start_now", f"appointment:{rec.id}")
+    else:
+        via = " on Google Meet" if rec.kind == "video" else ""
+        notify_appointment(db, rec, user, f"{label} scheduled", f"{label}{via} booked for {fmt_slot(rec.slot)}. No clinical details included.")
+        audit(db, user.id, "appointment.create", f"appointment:{rec.id}")
     db.commit()
     db.refresh(rec)
     return {
@@ -804,6 +983,7 @@ def create_appointment(
         "slot": rec.slot,
         "status": rec.status,
         "video_ref": rec.video_ref,
+        "has_meet_link": bool(rec.video_url),
     }
 
 
@@ -822,12 +1002,25 @@ def patch_appointment(
         raise HTTPException(400, "Invalid appointment status")
     rec.status = body.status
     rec.attendance_outcome = body.attendance_outcome
+    if body.slot:
+        rec.slot = body.slot
+    if body.meet_url and rec.kind == "video":
+        rec.video_url = clean_meet_url(body.meet_url)
+        rec.video_provider = "google_meet"
+        rec.video_ref = rec.video_url.rsplit("/", 1)[-1].split("?")[0]
+    label = "Video consultation" if rec.kind == "video" else "Appointment"
     if body.status == "MISSED":
         task = NavigationTask(referral_id=rec.referral_id, status="OVERDUE", contact_log="Missed appointment follow-up")
         db.add(task)
-        nav = db.query(User).filter(User.role == "navigator").first()
-        if nav:
-            notify(db, nav.id, "Missed appointment", "Follow-up required. No clinical details included.")
+        notify_appointment(db, rec, user, "Missed appointment", "Follow-up required. No clinical details included.")
+    elif body.status == "RESCHEDULED":
+        notify_appointment(db, rec, user, f"{label} rescheduled", f"New time: {fmt_slot(rec.slot)}.")
+    elif body.status == "CANCELLED":
+        notify_appointment(db, rec, user, f"{label} cancelled", f"The booking for {fmt_slot(rec.slot)} was cancelled.")
+    elif body.status == "CONFIRMED":
+        notify_appointment(db, rec, user, f"{label} confirmed", f"Confirmed for {fmt_slot(rec.slot)}.")
+    elif body.status == "COMPLETED":
+        notify_appointment(db, rec, user, f"{label} completed", "The consultation was marked completed.", roles={"health_worker", "medical_officer", "navigator"})
     if body.status == "COMPLETED":
         ref = db.get(Referral, rec.referral_id)
         if ref:
@@ -845,6 +1038,7 @@ def appointment_out(a: Appointment) -> dict:
         "slot": a.slot,
         "status": a.status,
         "video_ref": a.video_ref,
+        "has_meet_link": bool(a.video_url),
         "attendance_outcome": a.attendance_outcome,
     }
 
@@ -878,13 +1072,18 @@ def video_token(
         raise HTTPException(404, "Video appointment not found")
     if rec.status in {"CANCELLED"}:
         raise HTTPException(403, "Meeting link is not active")
-    if not rec.video_ref:
-        raise HTTPException(403, "Invalid meeting token")
     audit(db, user.id, "video.join", f"appointment:{rec.id}")
+    if user.role == "health_worker":
+        notify_appointment(db, rec, user, "Health worker joined the video call", "The patient side is ready. Join the consultation.", roles={"specialist", "medical_officer"}, dedupe_minutes=10)
+    else:
+        notify_appointment(db, rec, user, "Video consultation is live", "The doctor has started the call. Join now with the patient.", roles={"health_worker", "navigator"}, dedupe_minutes=10)
     db.commit()
+    if not rec.video_url:
+        raise HTTPException(409, "No Google Meet link has been added to this appointment yet")
     return {
+        "provider": "google_meet",
         "room": rec.video_ref,
-        "url": f"https://meet.jit.si/{rec.video_ref}",
+        "url": rec.video_url,
         "recording_default": False,
         "warning": "Synthetic demo consultation only.",
     }
@@ -1063,11 +1262,14 @@ def dashboard(db: Session = Depends(get_db), user: User = Depends(require_roles(
 
 @router.get("/audit")
 def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "medical_officer"))):
-    rows = db.query(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(200).all()
+    rows = db.query(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(500).all()
+    actors = {u.id: u for u in db.query(User).all()}
     return [
         {
             "id": a.id,
             "actor_id": a.actor_id,
+            "actor_name": actors[a.actor_id].full_name if a.actor_id in actors else None,
+            "actor_role": actors[a.actor_id].role if a.actor_id in actors else None,
             "event": a.event,
             "resource": a.resource,
             "created_at": a.created_at.isoformat(),
@@ -1078,6 +1280,7 @@ def list_audit(db: Session = Depends(get_db), user: User = Depends(require_roles
 
 @router.get("/notifications")
 def list_notes(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    make_call_reminders(db, user)
     rows = db.query(Notification).filter(Notification.user_id == user.id).order_by(Notification.created_at.desc()).all()
     return [{"id": n.id, "title": n.title, "body": n.body, "read": n.read, "created_at": n.created_at.isoformat()} for n in rows]
 
@@ -1090,6 +1293,96 @@ def read_note(note_id: str, db: Session = Depends(get_db), user: User = Depends(
     rec.read = True
     db.commit()
     return {"id": rec.id, "read": True}
+
+
+def _work_status(db: Session, u: User) -> dict:
+    """Role-specific work figures shown on the admin user page. Counts only, no patient identities."""
+    def n(q):
+        return q.count()
+
+    out: dict = {}
+    if u.role == "health_worker":
+        out = {
+            "patients_registered": n(db.query(Patient).filter(Patient.created_by == u.id)),
+            "screenings_done": n(db.query(Screening).filter(Screening.examiner_id == u.id)),
+            "photos_uploaded": n(db.query(ImageRecord).filter(ImageRecord.created_by == u.id)),
+            "awaiting_clinician": n(db.query(Screening).filter(Screening.examiner_id == u.id, Screening.status == "AWAITING_CLINICIAN")),
+        }
+    elif u.role == "medical_officer":
+        out = {
+            "reviews_signed": n(db.query(ClinicalReview).filter(ClinicalReview.doctor_id == u.id)),
+            "referrals_created": n(db.query(Referral).filter(Referral.created_by == u.id)),
+            "cases_waiting_review": n(db.query(Screening).filter(Screening.status.in_(["AWAITING_CLINICIAN", "SCREENED"]))),
+        }
+    elif u.role == "specialist":
+        out = {
+            "referrals_in_system": n(db.query(Referral)),
+            "appointments_completed": n(db.query(Appointment).filter(Appointment.status == "COMPLETED")),
+            "appointments_open": n(db.query(Appointment).filter(Appointment.status.in_(["REQUESTED", "CONFIRMED", "SCHEDULED", "RESCHEDULED"]))),
+            "investigations_reviewed": n(db.query(Investigation).filter(Investigation.state == "CLINICIAN_REVIEWED")),
+            "investigations_pending": n(db.query(Investigation).filter(Investigation.state != "CLINICIAN_REVIEWED")),
+        }
+    elif u.role == "navigator":
+        out = {
+            "tasks_assigned": n(db.query(NavigationTask).filter(NavigationTask.owner_id == u.id)),
+            "tasks_open": n(db.query(NavigationTask).filter(NavigationTask.owner_id == u.id, NavigationTask.status.in_(["OPEN", "OVERDUE"]))),
+            "tasks_closed": n(db.query(NavigationTask).filter(NavigationTask.owner_id == u.id, NavigationTask.status.notin_(["OPEN", "OVERDUE"]))),
+            "unassigned_tasks": n(db.query(NavigationTask).filter(NavigationTask.owner_id.is_(None))),
+        }
+    events = db.query(AuditEvent).filter(AuditEvent.actor_id == u.id).order_by(AuditEvent.created_at.desc())
+    out["audit_events"] = events.count()
+    last = events.first()
+    return {
+        "metrics": out,
+        "last_activity": last.created_at.isoformat() if last else None,
+        "recent_activity": [
+            {"event": e.event, "resource": e.resource, "created_at": e.created_at.isoformat()} for e in events.limit(8).all()
+        ],
+    }
+
+
+@router.get("/admin/users")
+def admin_list_users(status: str | None = None, role: str | None = None, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    q = db.query(User).filter(User.role != "admin")
+    if status:
+        q = q.filter(User.status == status)
+    if role:
+        q = q.filter(User.role == role)
+    rows = q.order_by(User.created_at.desc()).all()
+    return [user_out(u) for u in rows]
+
+
+@router.get("/admin/users/{user_id}")
+def admin_get_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    u = db.get(User, user_id)
+    if not u or u.role == "admin":
+        raise HTTPException(404, "User not found")
+    audit(db, user.id, "admin.user.view", f"user:{u.id}")
+    db.commit()
+    return {"user": user_out(u), "work": _work_status(db, u)}
+
+
+def _decide_user(user_id: str, decision: str, db: Session, admin: User) -> dict:
+    u = db.get(User, user_id)
+    if not u or u.role == "admin":
+        raise HTTPException(404, "User not found")
+    if u.status != "pending":
+        raise HTTPException(409, f"Registration already {u.status}")
+    u.status = "active" if decision == "approve" else "rejected"
+    notify(db, u.id, "Registration " + ("approved" if decision == "approve" else "declined"), "Your account was reviewed by the district admin.")
+    audit(db, admin.id, f"admin.user.{decision}", f"user:{u.id}", json.dumps({"role": u.role}))
+    db.commit()
+    return user_out(u)
+
+
+@router.post("/admin/users/{user_id}/approve")
+def approve_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    return _decide_user(user_id, "approve", db, user)
+
+
+@router.post("/admin/users/{user_id}/reject")
+def reject_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
+    return _decide_user(user_id, "reject", db, user)
 
 
 @router.post("/admin/reset-demo")

@@ -23,6 +23,9 @@ def ensure_schema() -> None:
 
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE ai_analyses ADD COLUMN IF NOT EXISTS feedback TEXT"))
+        conn.execute(text("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS video_provider VARCHAR(20) DEFAULT 'google_meet'"))
+        conn.execute(text("ALTER TABLE appointments ADD COLUMN IF NOT EXISTS video_url VARCHAR(300)"))
+        conn.execute(text("UPDATE appointments SET video_provider = 'google_meet' WHERE video_provider IS NULL OR video_provider = 'jitsi'"))
 
 
 def get_db():
