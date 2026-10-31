@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Link, NavLink, Navigate, useNavigate, useParams } from "react-router-dom";
 import { api, clearSession, currentUser, enqueue, flushQueue, getQueue, getToken, newIdempotencyKey, setSession } from "../api";
 import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "../common";
@@ -18,6 +18,11 @@ export default function PatientProfile() {
   const [preview, setPreview] = useState("");
   const [view, setView] = useState("cheek");
   const [analyzing, setAnalyzing] = useState(false);
+  // The photo that is currently selected for analysis. Set on every successful upload and cleared on Retake,
+  // so "Analyse" can never fall back to an older photo.
+  const [activeImageId, setActiveImageId] = useState("");
+  const [fileKey, setFileKey] = useState(0); // remounts the <input type=file> so picking the same file name fires onChange again
+  const previewUrl = useRef("");
   const consentCopy = {
     examination: t.consentExam,
     imaging: t.consentImage,
@@ -52,33 +57,50 @@ export default function PatientProfile() {
     setSid(s.id);
     setDetail(await api(`/screenings/${s.id}`));
   }
+  function setPreviewUrl(url) {
+    if (previewUrl.current) URL.revokeObjectURL(previewUrl.current);
+    previewUrl.current = url;
+    setPreview(url);
+  }
+  useEffect(() => () => { if (previewUrl.current) URL.revokeObjectURL(previewUrl.current); }, []);
+  function retake() {
+    setPreviewUrl("");
+    setActiveImageId("");
+    setFileKey((k) => k + 1);
+    setMsg("Choose or capture a new photo. It will be uploaded and the new photo is the one that gets analysed.");
+  }
   async function upload(e) {
     const picked = e.target.files?.[0];
     if (!picked || !sid) return;
     try {
       const file = await toUploadable(picked);
-      setPreview(URL.createObjectURL(file));
       const fd = new FormData();
       fd.append("file", file);
       fd.append("view", view);
       const r = await api(`/screenings/${sid}/images`, { method: "POST", body: fd });
+      // Only after the server accepted it: this upload is now the photo to analyse.
+      setActiveImageId(r.id);
+      setPreviewUrl(URL.createObjectURL(file));
       setMsg(
         r.quality_status === "pending_ai"
-          ? "Photo uploaded. The AI will check the photo quality when you analyse it."
+          ? "New photo uploaded. Tap Analyse to send this photo to the AI."
           : `Image quality: ${r.quality_status} ${r.quality_reason || ""}. ${r.warning || ""}`
       );
       setDetail(await api(`/screenings/${sid}`));
     } catch (err) {
       setMsg(err.message || "Upload failed");
+    } finally {
+      setFileKey((k) => k + 1); // allow re-selecting the same file name
     }
   }
   async function analyze() {
     const imgs = detail?.images || [];
-    if (!imgs.length) {
-      setMsg("Upload a photo first.");
+    // Always the photo that was just uploaded (never an older "acceptable" one). Images arrive oldest to newest.
+    const target = imgs.find((im) => im.id === activeImageId);
+    if (!target) {
+      setMsg(imgs.length ? "Upload the new photo first, then tap Analyse." : "Upload a photo first.");
       return;
     }
-    const target = [...imgs].reverse().find((im) => im.quality_status === "acceptable") || imgs[imgs.length - 1];
     setAnalyzing(true);
     setMsg("Sending the photo to the AI service… this can take up to a minute.");
     try {
@@ -171,11 +193,11 @@ export default function PatientProfile() {
                   <option value="floor">floor of mouth</option>
                 </select>
                 <label>{t.capture}</label>
-                <input type="file" accept="image/*" capture="environment" onChange={upload} />
+                <input key={fileKey} type="file" accept="image/*" capture="environment" onChange={upload} />
                 {preview && <img className="preview" alt="preview" src={preview} />}
                 <div className="row">
-                  <button className="secondary" onClick={() => { setPreview(""); }}>{t.retake}</button>
-                  <button onClick={analyze} disabled={analyzing || !detail?.images?.length}>{analyzing ? "Analysing photo…" : t.analyze}</button>
+                  <button className="secondary" onClick={retake} disabled={analyzing}>{t.retake}</button>
+                  <button onClick={analyze} disabled={analyzing || !activeImageId}>{analyzing ? "Analysing photo…" : t.analyze}</button>
                 </div>
               </>
             )}
@@ -183,21 +205,27 @@ export default function PatientProfile() {
               <div className="small">
                 {(detail.images || []).map((im) => (
                   <p key={im.id}>
-                    {im.view}: <Pill>{im.quality_status}</Pill> {im.quality_reason || ""}
+                    {im.view}: <Pill>{im.quality_status}</Pill> {im.quality_reason || ""}{im.id === activeImageId ? " (current photo)" : ""}
                   </p>
                 ))}
               </div>
             )}
-            {detail && (detail.ai_analyses || []).length > 0 && (
-              <div>
-                {detail.ai_analyses.slice(0, -1).map((a) => (
-                  <p key={a.id} className="small">
-                    Earlier run: {a.research_label || a.status} · {a.model_version}
-                  </p>
-                ))}
-                <AiFeedback analysis={detail.ai_analyses[detail.ai_analyses.length - 1]} audience="worker" />
-              </div>
-            )}
+            {detail && (detail.ai_analyses || []).length > 0 && (() => {
+              const all = detail.ai_analyses;
+              // Show the result for the current photo only; results for earlier photos are kept as one-line history.
+              const current = activeImageId ? all.filter((a) => a.image_id === activeImageId).slice(-1)[0] : null;
+              const earlier = all.filter((a) => a !== current);
+              return (
+                <div>
+                  {earlier.map((a) => (
+                    <p key={a.id} className="small">
+                      Earlier run{a.image_id ? ` (photo ${a.image_id.slice(0, 8)})` : ""}: {a.research_label || a.status} · {a.model_version}
+                    </p>
+                  ))}
+                  {current ? <AiFeedback analysis={current} audience="worker" /> : <p className="small">{activeImageId ? "Not analysed yet. Tap Analyse for the new photo." : "Upload a new photo to analyse it."}</p>}
+                </div>
+              );
+            })()}
           </div>
         </>
       )}

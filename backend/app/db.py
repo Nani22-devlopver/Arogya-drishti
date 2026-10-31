@@ -1,12 +1,35 @@
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
 
-if not settings.DATABASE_URL.startswith("postgresql"):
-    raise RuntimeError("DATABASE_URL must be a PostgreSQL URL (postgresql+psycopg2://user:pass@host:5432/db)")
 
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+def normalize_database_url(raw: str) -> str:
+    """Accept any PostgreSQL URL, including the ones Supabase / Heroku-style hosts hand out.
+
+    - postgres:// and postgresql:// are switched to the psycopg2 driver
+    - Supabase hosts (…supabase.co, …pooler.supabase.com) get sslmode=require when it is not set
+    """
+    raw = (raw or "").strip()
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://"):]
+    if raw.startswith("postgresql://"):
+        raw = "postgresql+psycopg2://" + raw[len("postgresql://"):]
+    if not raw.startswith("postgresql"):
+        raise RuntimeError("DATABASE_URL must be a PostgreSQL URL (postgresql+psycopg2://user:pass@host:5432/db)")
+    url = make_url(raw)
+    host = url.host or ""
+    if host.endswith("supabase.co") or host.endswith("supabase.com"):
+        if "sslmode" not in url.query:
+            url = url.update_query_dict({"sslmode": "require"})
+    return url.render_as_string(hide_password=False)
+
+
+DATABASE_URL = normalize_database_url(settings.DATABASE_URL)
+
+# pool_pre_ping + pool_recycle keep connections healthy through cloud poolers (Supabase pgbouncer drops idle ones).
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 

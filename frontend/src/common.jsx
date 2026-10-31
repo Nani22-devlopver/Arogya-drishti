@@ -200,12 +200,14 @@ export function Loading() {
 export function toast(text) {
   window.dispatchEvent(new CustomEvent("app-toast", { detail: text }));
 }
+export const MAX_TOASTS = 3; // never show more than 3 alerts at once
 export function Toasts() {
   const [items, setItems] = useState([]);
   useEffect(() => {
     const h = (e) => {
       const id = Math.random();
-      setItems((x) => [...x, { id, text: e.detail }]);
+      // newest alerts stay; anything beyond the limit is dropped from the oldest end
+      setItems((x) => [...x.filter((i) => i.text !== e.detail), { id, text: e.detail }].slice(-MAX_TOASTS));
       setTimeout(() => setItems((x) => x.filter((i) => i.id !== id)), 6000);
     };
     window.addEventListener("app-toast", h);

@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # PostgreSQL only
+    # PostgreSQL only: local Postgres, or Supabase cloud (paste its connection string into DATABASE_URL).
     DATABASE_URL: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/aarogya_drishti"
     JWT_SECRET: str = "local-demo-secret-not-for-production"
     JWT_EXPIRE_MINUTES: int = 480
@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     STORAGE_DIR: str = str(Path(__file__).resolve().parents[1] / "storage")
     AI_FORCE_FAIL: bool = False
     SEED_ON_START: bool = True
+    # Also insert synthetic cases at every workflow stage so the medical officer, specialist and navigator pages
+    # have data straight from the database without waiting for a health worker to create it.
+    SEED_DEMO_DATA: bool = True
     PORT: int = 8000
 
     # AI image analysis. AI_PROVIDER: "auto" (Ollama Cloud if OLLAMA_API_KEY is set, else mock),

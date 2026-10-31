@@ -405,9 +405,15 @@ def create_screening(
 @router.get("/screenings")
 def list_screenings(
     status: str | None = None,
+    awaiting_review: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
 ):
+    """Screenings read straight from the database.
+
+    awaiting_review=true returns every screening of the user's scope that has no signed review yet, whatever stage
+    the health worker left it in (the medical officer never waits for a particular status).
+    """
     if user.role == "admin":
         raise HTTPException(403, "Administrators receive aggregate data only")
     if user.role == "navigator":
@@ -415,6 +421,9 @@ def list_screenings(
     q = db.query(Screening)
     if status:
         q = q.filter(Screening.status == status)
+    if awaiting_review:
+        reviewed = db.query(ClinicalReview.screening_id)
+        q = q.filter(~Screening.id.in_(reviewed))
     if user.role in {"health_worker", "medical_officer"}:
         patients = db.query(Patient.id).filter(Patient.facility == user.assigned_facility)
         q = q.filter(Screening.patient_id.in_(patients))
@@ -422,14 +431,20 @@ def list_screenings(
         referred = db.query(Referral.patient_id)
         q = q.filter(Screening.patient_id.in_(referred))
     rows = q.order_by(Screening.created_at.desc()).limit(200).all()
+    patient_ids = {s.patient_id for s in rows}
+    people = {p.id: p for p in db.query(Patient).filter(Patient.id.in_(patient_ids)).all()} if patient_ids else {}
+    analysed = {r[0] for r in db.query(AiAnalysis.screening_id).filter(AiAnalysis.screening_id.in_([s.id for s in rows])).all()} if rows else set()
     return [
         {
             "id": s.id,
             "patient_id": s.patient_id,
+            "patient_name": people[s.patient_id].full_name if s.patient_id in people else None,
+            "village": people[s.patient_id].village if s.patient_id in people else None,
             "status": s.status,
             "symptoms": s.symptoms,
             "tobacco": s.tobacco,
             "exam_notes": s.exam_notes,
+            "has_ai": s.id in analysed,
             "created_at": s.created_at.isoformat(),
         }
         for s in rows
@@ -465,6 +480,7 @@ def get_screening(screening_id: str, db: Session = Depends(get_db), user: User =
         "ai_analyses": [
             {
                 "id": a.id,
+                "image_id": a.image_id,
                 "status": a.status,
                 "research_label": a.research_label,
                 "model_version": a.model_version,
@@ -646,6 +662,8 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
     if not path.exists():
         raise HTTPException(404, "Stored file missing")
     raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != image.checksum:
+        raise HTTPException(409, "The stored photo does not match its upload record. Please upload the photo again.")
 
     if use_ollama:
         patient = db.get(Patient, s.patient_id)
@@ -702,6 +720,7 @@ def ai_analyze(body: AnalyzeIn, db: Session = Depends(get_db), user: User = Depe
     return {
         "analysis_id": rec.id,
         "screening_id": s.id,
+        "image_id": image.id,
         "status": rec.status,
         "image_quality": image.quality_status,
         "provider": rec.provider,

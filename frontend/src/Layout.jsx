@@ -1,7 +1,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { Link, NavLink, Navigate, useNavigate, useParams } from "react-router-dom";
 import { api, clearSession, currentUser, enqueue, flushQueue, getQueue, getToken, newIdempotencyKey, setSession } from "./api";
-import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "./common";
+import { useI18n, ICONS, Icon, initials, tone, Pill, toUploadable, AI_LABELS, URGENCY_KIND, URGENCY_TEXT, BulletList, AiFeedback, Empty, Loading, toast, Toasts, MAX_TOASTS, PageHead, slotLabel, localToSlot, slotToLocalInput, defaultSlotInput, weekdayLabel, isPast, DateTimePick } from "./common";
 
 export function Shell({ children }) {
   const user = currentUser();
@@ -19,18 +19,19 @@ export function Shell({ children }) {
   const [unread, setUnread] = useState(0);
   useEffect(() => {
     if (!user) return undefined;
-    const seen = new Set(JSON.parse(sessionStorage.getItem("seenNotes") || "null") || []);
-    const first = !sessionStorage.getItem("seenNotes");
+    // Pop-up alerts: at most 3 per check (newest first), also capped at 3 on screen by <Toasts/>.
+    const key = `seenNotes:${user.id}`;
+    const stored = sessionStorage.getItem(key);
+    const seen = new Set(JSON.parse(stored || "[]"));
     const load = async () => {
       try {
-        const rows = await api("/notifications");
+        const rows = await api("/notifications"); // newest first
         const fresh = rows.filter((n) => !n.read);
         setUnread(fresh.length);
-        fresh.forEach((n) => {
-          if (!seen.has(n.id) && !first) toast(`${n.title}: ${n.body.replace(/\s*\[appt:[^\]]+\]/, "")}`);
-          seen.add(n.id);
-        });
-        sessionStorage.setItem("seenNotes", JSON.stringify([...seen]));
+        const toShow = fresh.filter((n) => !seen.has(n.id)).slice(0, MAX_TOASTS).reverse();
+        toShow.forEach((n) => toast(`${n.title}: ${n.body.replace(/\s*\[appt:[^\]]+\]/, "")}`));
+        fresh.forEach((n) => seen.add(n.id));
+        sessionStorage.setItem(key, JSON.stringify([...seen]));
       } catch {
         /* offline: keep last badge */
       }

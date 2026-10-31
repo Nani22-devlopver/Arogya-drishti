@@ -4,12 +4,20 @@ export function getToken() {
   return localStorage.getItem("token") || "";
 }
 
+function resetSeenAlerts() {
+  try {
+    Object.keys(sessionStorage).filter((k) => k.startsWith("seenNotes")).forEach((k) => sessionStorage.removeItem(k));
+  } catch { /* storage unavailable */ }
+}
+
 export function setSession(token, user) {
+  resetSeenAlerts(); // a fresh login shows its (max 3) alerts again
   localStorage.setItem("token", token);
   localStorage.setItem("user", JSON.stringify(user));
 }
 
 export function clearSession() {
+  resetSeenAlerts();
   localStorage.removeItem("token");
   localStorage.removeItem("user");
 }

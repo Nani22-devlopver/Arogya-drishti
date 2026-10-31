@@ -18,8 +18,8 @@ export default function Reviews() {
 
   async function load() {
     try {
-      const [a, b] = await Promise.all([api("/screenings?status=AWAITING_CLINICIAN"), api("/screenings?status=SCREENED")]);
-      setRows([...a, ...b]);
+      // Read straight from the database: every screening of this facility that has no signed review yet.
+      setRows(await api("/screenings?awaiting_review=true"));
     } catch (e) {
       setErr(e.message);
       setRows([]);
@@ -66,7 +66,7 @@ export default function Reviews() {
   }
 
   const list = (rows || []).filter((s) => {
-    const hay = `${s.id} ${s.symptoms || ""} ${s.exam_notes || ""} ${s.status || ""}`.toLowerCase();
+    const hay = `${s.id} ${s.patient_name || ""} ${s.village || ""} ${s.symptoms || ""} ${s.exam_notes || ""} ${s.status || ""}`.toLowerCase();
     return hay.includes(q.trim().toLowerCase());
   });
 
@@ -89,7 +89,7 @@ export default function Reviews() {
                   <button type="button" className={`rec ${sel?.id === s.id ? "on" : ""}`} onClick={() => open(s.id)}>
                     <span className="avatar">{initials(s.symptoms || "C")}</span>
                     <span className="rec-body">
-                      <b>#{s.id.slice(0, 8)}</b>
+                      <b>{s.patient_name || `#${s.id.slice(0, 8)}`}</b>
                       <span>{(s.symptoms || s.exam_notes || "No notes").slice(0, 60)}</span>
                     </span>
                     {s.status && <Pill>{s.status.replace(/_/g, " ")}</Pill>}

@@ -176,6 +176,13 @@ Google Meet is the only video provider. Jitsi was removed.
 - Automatic Meet link creation would need a Google Cloud OAuth setup (Calendar API `conferenceData`) and is not included, so no Google credentials are required.
 - Existing databases upgrade automatically on start; any old appointment is marked Google Meet and needs a link added before it can be joined.
 
+## Latest changes (retake fix, alert cap, DB-first data, Supabase-ready)
+
+- **Retake analyses the new photo.** The profile page now remembers which uploaded photo is current. **Analyse** always sends that photo (the old code preferred the first "acceptable" photo, so an old image was re-sent). **Retake** clears the preview, disables Analyse until a new photo is uploaded, and hides the previous result. The same file name can be picked again. `GET /screenings/{id}` returns `image_id` per analysis, `POST /ai/analyze` returns the `image_id` it used and checks the stored file against its checksum.
+- **At most 3 alerts, bottom-right.** Pop-up alerts are capped at 3 on screen, and a fresh login shows the 3 newest unread ones. The sidebar badge still shows the full unread count.
+- **MO, specialist and navigator pages read the database directly.** `GET /screenings?awaiting_review=true` returns every screening without a signed review, whatever stage the health worker left it in (with patient name and village). On start, `SEED_DEMO_DATA=true` inserts synthetic cases at each stage (awaiting review, referred, appointment, investigation, closed) once per database, so those pages are never empty.
+- **Supabase-ready.** Only `DATABASE_URL` changes. `postgres://` and `postgresql://` URLs are accepted, `sslmode=require` is added for `*.supabase.co` / `*.supabase.com`, and the pool recycles idle connections. Tables are created on start. Uploaded photos are still stored in `STORAGE_DIR` (not in the database).
+
 ## Troubleshooting
 
 - **Blank page or "something went wrong" on a role's page:** open the browser console (F12). After updating, run `npm install` once and restart `npm run dev`; hard-refresh (Ctrl+Shift+R) so the old service-worker cache is not served.

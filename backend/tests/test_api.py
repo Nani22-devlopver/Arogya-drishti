@@ -15,6 +15,7 @@ os.environ["DATABASE_URL"] = os.getenv(
     "postgresql+psycopg2://postgres:postgres@localhost:5432/aarogya_drishti_test",
 )
 os.environ["SEED_ON_START"] = "true"
+os.environ["SEED_DEMO_DATA"] = "false"  # keep the journey tests deterministic; test_roles_load_straight_from_db seeds explicitly
 os.environ["LOCAL_QUALITY_CHECK"] = "true"  # existing tests exercise the local gate; see test_ai_judges_quality_when_local_check_off
 os.environ["JWT_SECRET"] = "test-secret-not-for-production-use-32b"
 os.environ["STORAGE_DIR"] = str(ROOT / "storage-test")
@@ -440,3 +441,35 @@ def test_google_meet_link_validation():
             raise AssertionError(bad)
         except HTTPException as e:
             assert e.status_code == 422
+
+
+def test_roles_load_straight_from_db():
+    """MO, specialist and navigator see database records without any health-worker action in this session."""
+    from app.seed import seed_demo_pipeline
+
+    db = SessionLocal()
+    try:
+        seed_demo_pipeline(db)
+        seed_demo_pipeline(db)  # idempotent
+    finally:
+        db.close()
+    mo, spec, nav = auth("mo@demo.local"), auth("spec@demo.local"), auth("nav@demo.local")
+    queue = client.get("/screenings?awaiting_review=true", headers=mo)
+    assert queue.status_code == 200
+    names = [r["patient_name"] for r in queue.json()]
+    assert any("Ramulu" in (n or "") for n in names) and any("Savitri" in (n or "") for n in names)
+    assert all(r["status"] not in {"REVIEWED", "REFERRAL_PLANNED", "CARE_LINKED"} for r in queue.json())
+    refs = client.get("/referrals", headers=spec)
+    assert refs.status_code == 200 and any("Appa Rao" in (r["patient_name"] or "") for r in refs.json())
+    assert client.get("/appointments", headers=spec).json()
+    assert client.get("/investigations", headers=spec).json()
+    assert client.get("/navigation", headers=nav).json()
+
+
+def test_database_url_normalised_for_supabase():
+    from app.db import normalize_database_url
+
+    url = normalize_database_url("postgres://postgres:pw@db.abcd.supabase.co:5432/postgres")
+    assert url.startswith("postgresql+psycopg2://") and "sslmode=require" in url
+    local = normalize_database_url("postgresql+psycopg2://postgres:pw@localhost:5432/x")
+    assert "sslmode" not in local
