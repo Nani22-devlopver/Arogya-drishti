@@ -90,13 +90,14 @@ The model acts like a **junior doctor**: it does not describe the picture. It na
 
 Setup (in `backend/.env`):
 
-```env
-AI_PROVIDER=auto                       # auto | ollama | mock
-LOCAL_QUALITY_CHECK=false              # false = the AI judges photo quality
-OLLAMA_API_KEY=your_key_from_https://ollama.com/settings/keys
-OLLAMA_MODEL=gemma4                    # must be vision-capable
-OLLAMA_FALLBACK_MODEL=                 # optional second model, tried if the first errors or is not found
-```
+AI_PROVIDER=ollama
+LOCAL_QUALITY_CHECK=false
+
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llava
+OLLAMA_FALLBACK_MODEL=
+OLLAMA_TIMEOUT_SECONDS=120
+OLLAMA_API_KEY=
 
 - `auto` uses Ollama Cloud when `OLLAMA_API_KEY` is set, otherwise the offline mock adapter, so the demo still works without internet.
 - Test your key and model without the web app: `cd backend && python scripts/test_ollama.py photo.jpg` (prints the feedback or the exact error).
