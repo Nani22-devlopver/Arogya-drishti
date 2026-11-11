@@ -274,9 +274,21 @@ def _translate_to_telugu(model: str, feedback: dict) -> dict | None:
 
 
 def _client() -> Client:
+    is_local = (
+        "localhost" in settings.OLLAMA_BASE_URL
+        or "127.0.0.1" in settings.OLLAMA_BASE_URL
+    )
+
+    headers = {}
+
+    if not is_local and settings.OLLAMA_API_KEY.strip():
+        headers["Authorization"] = (
+            "Bearer " + settings.OLLAMA_API_KEY.strip()
+        )
+
     return Client(
         host=settings.OLLAMA_BASE_URL.rstrip("/"),
-        headers={"Authorization": "Bearer " + settings.OLLAMA_API_KEY.strip()},
+        headers=headers,
         timeout=settings.OLLAMA_TIMEOUT_SECONDS,
     )
 
