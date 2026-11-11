@@ -301,8 +301,13 @@ def _call_model(model: str, image: bytes, context: dict) -> dict:
 
 
 def analyze(image_bytes: bytes, screening_id: str, context: dict | None = None) -> dict:
-    if not settings.OLLAMA_API_KEY.strip():
-        raise OllamaError("OLLAMA_API_KEY is not configured on the server")
+  is_local = (
+    "localhost" in settings.OLLAMA_BASE_URL
+    or "127.0.0.1" in settings.OLLAMA_BASE_URL
+)
+
+if not is_local and not settings.OLLAMA_API_KEY.strip():
+    raise OllamaError("OLLAMA_API_KEY is not configured for Ollama Cloud")
 
     context = context or {}
     image = _prepare_image(image_bytes)
